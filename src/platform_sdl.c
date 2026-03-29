@@ -1,5 +1,6 @@
 /*
- * SDL2 platform layer — window, renderer, audio output, frame timing.
+ * SDL2 platform layer — window, renderer, audio output, frame timing,
+ * F12 screenshot with toast notification.
  */
 
 #include "snesrecomp/platform.h"
@@ -7,6 +8,13 @@
 #include "snesrecomp/snesrecomp.h"
 #include <SDL.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "stb_image_write.h"
+
+#ifdef SNESRECOMP_HAS_TTF
+#include <SDL_ttf.h>
+#endif
 
 static SDL_Window   *s_window   = NULL;
 static SDL_Renderer *s_renderer = NULL;
@@ -27,20 +35,147 @@ static void recreate_texture(int filter) {
     s_cur_filter = filter;
 }
 
+/* Screenshot state */
+static int  s_screenshot_counter = 0;
+static bool s_screenshot_requested = false;
+
+/* Toast notification state */
+static char         s_toast_msg[256] = {0};
+static Uint32       s_toast_start = 0;
+static SDL_Texture *s_toast_tex = NULL;
+static int          s_toast_w = 0;
+static int          s_toast_h = 0;
+#define TOAST_DURATION_MS  2500
+#define TOAST_FADE_MS       500
+#define TOAST_PADDING       8
+
+#ifdef SNESRECOMP_HAS_TTF
+static TTF_Font *s_font = NULL;
+#endif
+
 /* NTSC frame time: ~16.6393 ms (60.098 Hz) */
 static const double FRAME_TIME_MS = 1000.0 / 60.098;
+
+static void show_toast(const char *msg) {
+    snprintf(s_toast_msg, sizeof(s_toast_msg), "%s", msg);
+    s_toast_start = SDL_GetTicks();
+
+    /* Destroy previous toast texture */
+    if (s_toast_tex) {
+        SDL_DestroyTexture(s_toast_tex);
+        s_toast_tex = NULL;
+    }
+
+#ifdef SNESRECOMP_HAS_TTF
+    if (s_font && s_renderer) {
+        SDL_Color white = {255, 255, 255, 255};
+        SDL_Surface *surf = TTF_RenderText_Blended(s_font, msg, white);
+        if (surf) {
+            s_toast_tex = SDL_CreateTextureFromSurface(s_renderer, surf);
+            s_toast_w = surf->w;
+            s_toast_h = surf->h;
+            SDL_FreeSurface(surf);
+            SDL_SetTextureBlendMode(s_toast_tex, SDL_BLENDMODE_BLEND);
+        }
+    }
+#endif
+}
+
+static void take_screenshot(void) {
+    int w, h;
+    SDL_GetRendererOutputSize(s_renderer, &w, &h);
+
+    uint8_t *pixels = (uint8_t *)malloc(w * h * 4);
+    if (!pixels) return;
+
+    if (SDL_RenderReadPixels(s_renderer, NULL, SDL_PIXELFORMAT_RGBA32,
+                             pixels, w * 4) == 0) {
+        char filename[512];
+        snprintf(filename, sizeof(filename), "screenshot_%04d.png",
+                 s_screenshot_counter++);
+        stbi_write_png(filename, w, h, 4, pixels, w * 4);
+        printf("Screenshot saved: %s\n", filename);
+        fflush(stdout);
+        show_toast(filename);
+    }
+    free(pixels);
+}
+
+static void draw_toast(void) {
+    if (s_toast_msg[0] == '\0') return;
+
+    Uint32 elapsed = SDL_GetTicks() - s_toast_start;
+    if (elapsed >= TOAST_DURATION_MS) {
+        s_toast_msg[0] = '\0';
+        if (s_toast_tex) {
+            SDL_DestroyTexture(s_toast_tex);
+            s_toast_tex = NULL;
+        }
+        return;
+    }
+
+    /* Compute alpha (fade out in last TOAST_FADE_MS) */
+    float alpha = 1.0f;
+    if (elapsed > TOAST_DURATION_MS - TOAST_FADE_MS) {
+        alpha = (float)(TOAST_DURATION_MS - elapsed) / (float)TOAST_FADE_MS;
+    }
+
+    int win_w, win_h;
+    SDL_GetRendererOutputSize(s_renderer, &win_w, &win_h);
+
+    SDL_SetRenderDrawBlendMode(s_renderer, SDL_BLENDMODE_BLEND);
+
+    if (s_toast_tex) {
+        /* Draw background box */
+        int box_w = s_toast_w + TOAST_PADDING * 2;
+        int box_h = s_toast_h + TOAST_PADDING * 2;
+        int box_x = win_w - box_w - TOAST_PADDING;
+        int box_y = win_h - box_h - TOAST_PADDING;
+
+        SDL_Rect bg = { box_x, box_y, box_w, box_h };
+        SDL_SetRenderDrawColor(s_renderer, 0, 0, 0, (Uint8)(180 * alpha));
+        SDL_RenderFillRect(s_renderer, &bg);
+
+        /* Draw text */
+        SDL_Rect dst = { box_x + TOAST_PADDING, box_y + TOAST_PADDING,
+                         s_toast_w, s_toast_h };
+        SDL_SetTextureAlphaMod(s_toast_tex, (Uint8)(255 * alpha));
+        SDL_RenderCopy(s_renderer, s_toast_tex, NULL, &dst);
+    } else {
+        /* Fallback: no TTF — draw a simple bar */
+        int bar_h = 20;
+        SDL_Rect bar = { 0, win_h - bar_h, win_w, bar_h };
+        SDL_SetRenderDrawColor(s_renderer, 40, 40, 40, (Uint8)(200 * alpha));
+        SDL_RenderFillRect(s_renderer, &bar);
+    }
+}
 
 bool platform_init(const char *window_title, int scale) {
     if (scale < 1) scale = 1;
     if (scale > 8) scale = 8;
 
-    int win_w = SNES_RENDER_WIDTH * scale / 2;  /* 512 is 2x native, scale from 256 */
-    int win_h = SNES_RENDER_HEIGHT * scale / 2;  /* 478 is ~2x native */
+    int win_w = SNES_RENDER_WIDTH * scale / 2;
+    int win_h = SNES_RENDER_HEIGHT * scale / 2;
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return false;
     }
+
+#ifdef SNESRECOMP_HAS_TTF
+    if (TTF_Init() == 0) {
+        /* Try common Windows system font paths */
+        const char *font_paths[] = {
+            "C:/Windows/Fonts/segoeui.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/consola.ttf",
+            NULL
+        };
+        for (int i = 0; font_paths[i] && !s_font; i++) {
+            s_font = TTF_OpenFont(font_paths[i], 14);
+        }
+    }
+#endif
 
     s_window = SDL_CreateWindow(
         window_title ? window_title : "snesrecomp",
@@ -63,7 +198,6 @@ bool platform_init(const char *window_title, int scale) {
         return false;
     }
 
-    /* Use linear filtering for scaling */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
 
     s_texture = SDL_CreateTexture(s_renderer,
@@ -81,15 +215,15 @@ bool platform_init(const char *window_title, int scale) {
     /* Initialize audio */
     SDL_AudioSpec want, have;
     SDL_memset(&want, 0, sizeof(want));
-    want.freq = 32040;       /* SNES native sample rate */
+    want.freq = 32040;
     want.format = AUDIO_S16;
     want.channels = 2;
     want.samples = 1024;
-    want.callback = NULL;    /* Push mode */
+    want.callback = NULL;
 
     s_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (s_audio_dev > 0) {
-        SDL_PauseAudioDevice(s_audio_dev, 0);  /* Start playback */
+        SDL_PauseAudioDevice(s_audio_dev, 0);
     }
 
     SDL_SetRenderDrawColor(s_renderer, 0, 0, 0, 255);
@@ -149,13 +283,19 @@ void platform_present_frame(const uint8_t *framebuffer) {
     SDL_RenderClear(s_renderer);
     SDL_RenderCopy(s_renderer, s_texture, &src, &dst);
     menu_overlay_render(s_renderer);   /* ImGui menu on top (no-op when disabled) */
+    draw_toast();                      /* screenshot toast above everything */
     SDL_SetRenderDrawColor(s_renderer, 0, 0, 0, 255);   /* restore */
     SDL_RenderPresent(s_renderer);
+
+    /* Take screenshot after present */
+    if (s_screenshot_requested) {
+        s_screenshot_requested = false;
+        take_screenshot();
+    }
 }
 
 void platform_queue_audio(const int16_t *samples, int sample_count) {
     if (s_audio_dev > 0 && samples && sample_count > 0) {
-        /* Don't let audio buffer grow too large */
         uint32_t queued = SDL_GetQueuedAudioSize(s_audio_dev);
         if (queued < 32040 * 2 * 2 * 4) { /* ~4 frames max */
             float vol = menu_overlay_get_volume();   /* 1.0 when menu disabled */
@@ -193,6 +333,8 @@ bool platform_poll_events(void) {
                 /* Save-state hotkeys (mirror File -> Save / Load). */
                 if (ev.key.keysym.sym == SDLK_F5) snesrecomp_save_state("smk_state.sav");
                 if (ev.key.keysym.sym == SDLK_F8) snesrecomp_load_state("smk_state.sav");
+                if (ev.key.keysym.sym == SDLK_F12 && !ev.key.repeat)
+                    s_screenshot_requested = true;
             }
             break;
         case SDL_MOUSEMOTION:
@@ -220,6 +362,16 @@ void platform_frame_sync(void) {
 
 void platform_shutdown(void) {
     menu_overlay_shutdown();
+
+    if (s_toast_tex) SDL_DestroyTexture(s_toast_tex);
+    s_toast_tex = NULL;
+
+#ifdef SNESRECOMP_HAS_TTF
+    if (s_font) TTF_CloseFont(s_font);
+    s_font = NULL;
+    TTF_Quit();
+#endif
+
     if (s_audio_dev > 0) {
         SDL_CloseAudioDevice(s_audio_dev);
         s_audio_dev = 0;

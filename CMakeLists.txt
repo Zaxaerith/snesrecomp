@@ -75,12 +75,19 @@ add_library(snesrecomp STATIC
     src/platform_sdl.c
     src/input.c
     src/mp_session.c
+    src/stb_impl.c
     ${SNESRECOMP_MENU_SRC}
 )
 target_include_directories(snesrecomp
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${LAKESNES_DIR}
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ext
 )
+find_package(sdl2-ttf CONFIG QUIET)
+if(NOT sdl2-ttf_FOUND)
+    find_package(SDL2_ttf QUIET)
+endif()
+
 target_link_libraries(snesrecomp
     PUBLIC  lakesnes_hw
     PUBLIC  SDL2::SDL2
@@ -91,6 +98,13 @@ endif()
 if(SNESRECOMP_MENU)
     target_include_directories(snesrecomp PRIVATE ${IMGUI_DIR})
     target_link_libraries(snesrecomp PRIVATE imgui)
+endif()
+if(TARGET SDL2_ttf::SDL2_ttf)
+    target_link_libraries(snesrecomp PUBLIC SDL2_ttf::SDL2_ttf)
+    target_compile_definitions(snesrecomp PRIVATE SNESRECOMP_HAS_TTF=1)
+elseif(TARGET SDL2::SDL2_ttf)
+    target_link_libraries(snesrecomp PUBLIC SDL2::SDL2_ttf)
+    target_compile_definitions(snesrecomp PRIVATE SNESRECOMP_HAS_TTF=1)
 endif()
 
 # --- Example: minimal recomp ---
