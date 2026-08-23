@@ -2,6 +2,12 @@
 
 **Drop-in SNES hardware for your static recompilation project.**
 
+> **Contribution branch note:** `contrib/recompiler-correctness` contains the call-frame token,
+> timed-yield, and token-aware interpreter-fallback work used by the matching branch of
+> [`Zaxaerith/mk`](https://github.com/Zaxaerith/mk/tree/contrib/recompiler-correctness). The
+> fallback protocol is stack-safe, but fallback execution remains untimed and is not presented as
+> cycle-exact. The original project remains at [`sp00nznet/snesrecomp`](https://github.com/sp00nznet/snesrecomp).
+
 You write the recompiled game code. We give you real PPU rendering, SPC700 audio, DMA, Mode 7, and everything else the SNES had — as a linkable C library.
 
 ```
