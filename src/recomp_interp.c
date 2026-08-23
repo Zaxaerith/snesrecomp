@@ -368,9 +368,14 @@ void recomp_set_redirect(uint32_t snes_addr) { s_redirect = snes_addr; }
  * Indirect dispatch (JSR ($table,x)) is not target-resolvable here and is
  * skipped — leaves are virtually always called directly. */
 /* Records each direct JSR/JSL target with the M/X flags the callee enters with
- * (= the caller's current flags; JSR/JSL preserve P), and a multi-flag marker so
- * the auto-generator can skip per-(M,X) variant targets. */
-typedef struct { uint32_t addr; unsigned long count; uint8_t m, x, multi; } CallTally;
+ * (= the caller's current flags; JSR/JSL preserve P), including an exact variant
+ * mask so generators never have to guess which width combinations are legal. */
+typedef struct {
+    uint32_t addr;
+    unsigned long count;
+    uint8_t m, x, multi;
+    uint8_t variants;  /* bit ((M << 1) | X): exact observed entry widths */
+} CallTally;
 static CallTally s_tally[8192];
 static int       s_tally_n  = 0;
 static bool      s_profile  = false;
@@ -381,6 +386,7 @@ static void tally_call(uint32_t target, uint8_t m, uint8_t x) {
     for (int i = 0; i < s_tally_n; i++)
         if (s_tally[i].addr == target) {
             s_tally[i].count++;
+            s_tally[i].variants |= (uint8_t)(1u << ((m << 1) | x));
             if (s_tally[i].m != m || s_tally[i].x != x) s_tally[i].multi = 1;
             if (i > 0) {  /* move-to-front: keep hot targets cheap to find */
                 CallTally t = s_tally[i]; s_tally[i] = s_tally[i - 1]; s_tally[i - 1] = t;
@@ -391,6 +397,7 @@ static void tally_call(uint32_t target, uint8_t m, uint8_t x) {
         s_tally[s_tally_n].addr = target;
         s_tally[s_tally_n].count = 1;
         s_tally[s_tally_n].m = m; s_tally[s_tally_n].x = x; s_tally[s_tally_n].multi = 0;
+        s_tally[s_tally_n].variants = (uint8_t)(1u << ((m << 1) | x));
         s_tally_n++;
     }
 }
@@ -405,8 +412,24 @@ void recomp_timed_profile_dump(int top) {
         if (best < 0) break;
         CallTally *t = &s_tally[best];
         uint8_t P = (uint8_t)((t->m ? 0x20 : 0) | (t->x ? 0x10 : 0));
-        fprintf(stderr, "PROF %06X %-8lu %02X %s%s\n", t->addr, t->count, P,
-                t->multi ? "MULTI-MX " : "",
+        char variants[32] = "";
+        if (t->multi) {
+            size_t used = 0;
+            int first = 1;
+            used += (size_t)snprintf(variants + used, sizeof(variants) - used,
+                                     "VARIANTS=");
+            for (int state = 0; state < 4; state++) {
+                if (!(t->variants & (1u << state))) continue;
+                uint8_t vp = (uint8_t)(((state & 2) ? 0x20 : 0) |
+                                       ((state & 1) ? 0x10 : 0));
+                used += (size_t)snprintf(variants + used, sizeof(variants) - used,
+                                         "%s%02X", first ? "" : ",", vp);
+                first = 0;
+            }
+            snprintf(variants + used, sizeof(variants) - used, " ");
+        }
+        fprintf(stderr, "PROF %06X %-8lu %02X %s%s%s\n", t->addr, t->count, P,
+                t->multi ? "MULTI-MX " : "", variants,
                 func_table_lookup(t->addr) ? "recompiled" : "");
         t->count = 0;  /* consume so the next pass finds the next-highest */
     }
