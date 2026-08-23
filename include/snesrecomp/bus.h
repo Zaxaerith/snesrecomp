@@ -33,6 +33,15 @@ void     bus_write16(uint8_t bank, uint16_t addr, uint16_t val);
  * instruction with that instruction's real master-cycle cost. */
 void     recomp_tick(int cycles);
 
+/* Experimental bus-phase timing for generated instructions. When
+ * SMK_RECOMP_BUSPHASE=1, begin performs timed opcode/operand fetches, normal
+ * bus helpers perform timed data accesses, and end advances internal/stack
+ * phases. Without the flag, begin is exactly the legacy aggregate tick. */
+void     recomp_phase_begin(int aggregate_cycles, uint8_t bank, uint16_t pc,
+                            int instruction_bytes);
+void     recomp_phase_end(int internal_cycles, int synthetic_stack_accesses);
+bool     recomp_phase_interrupt_pending(void);
+
 /* Direct WRAM access (faster than bus routing for stack/DP operations) */
 uint8_t  bus_wram_read8(uint32_t offset);
 void     bus_wram_write8(uint32_t offset, uint8_t val);

@@ -9,6 +9,7 @@
  */
 
 #include "snesrecomp/bus.h"
+#include "snesrecomp/cpu.h"
 #include "snes.h"
 #include "cart.h"
 #include "apu.h"
@@ -20,6 +21,24 @@
 
 /* Access to the LakeSnes instance (owned by snesrecomp.c) */
 extern Snes *snesrecomp_get_snes(void);
+
+static int s_phase_mode = -1;
+static bool s_phase_active = false;
+
+static bool phase_mode(void) {
+    if (s_phase_mode < 0) {
+        const char *e = getenv("SMK_RECOMP_BUSPHASE");
+        s_phase_mode = e ? atoi(e) != 0 : 0;
+    }
+    return s_phase_mode != 0;
+}
+
+static void phase_advance(int cycles) {
+    Snes *snes = snesrecomp_get_snes();
+    if (!snes || cycles <= 0) return;
+    dma_handleDma(snes->dma, cycles);
+    snes_runCycles(snes, cycles);
+}
 
 /* Cycle-accurate model: a recompiled function advances the master clock by its
  * real per-instruction cost (autogen emits recomp_tick() calls) so the PPU/APU/
@@ -42,18 +61,66 @@ void recomp_tick(int cycles) {
     snes_runCycles(snes, cycles);
 }
 
+void recomp_phase_begin(int aggregate_cycles, uint8_t bank, uint16_t pc,
+                        int instruction_bytes) {
+    if (!phase_mode()) {
+        s_phase_active = false;
+        recomp_tick(aggregate_cycles);
+        return;
+    }
+    Snes *snes = snesrecomp_get_snes();
+    if (!snes) return;
+    s_phase_active = true;
+    for (int i = 0; i < instruction_bytes; i++)
+        (void)snes_cpuRead(snes, ((uint32_t)bank << 16) | (uint16_t)(pc + i));
+}
+
+void recomp_phase_end(int internal_cycles, int synthetic_stack_accesses) {
+    if (!phase_mode()) return;
+    /* Synthetic accesses account for RTS/RTL stack pulls performed later by
+     * the interception hook without touching live stack bytes a second time. */
+    for (int i = 0; i < synthetic_stack_accesses; i++) phase_advance(8);
+    while (internal_cycles >= 6) {
+        Snes *snes = snesrecomp_get_snes();
+        if (snes) snes_cpuIdle(snes, false);
+        internal_cycles -= 6;
+    }
+    if (internal_cycles > 0) phase_advance(internal_cycles);
+    s_phase_active = false;
+}
+
+bool recomp_phase_interrupt_pending(void) {
+    if (!phase_mode()) return false;
+    /* Yielding out of a nested native JSR also requires materializing that
+     * JSR's return address on the emulated stack. Keep the protocol opt-in
+     * until every generated call form does so; phase timing itself is safe. */
+    static int yield_on = -1;
+    if (yield_on < 0) {
+        const char *e = getenv("SMK_RECOMP_PHASE_YIELD");
+        yield_on = e ? atoi(e) != 0 : 0;
+    }
+    if (!yield_on) return false;
+    Snes *snes = snesrecomp_get_snes();
+    if (!snes || !snes->cpu) return false;
+    bool pending = snes->cpu->nmiWanted ||
+                   (snes->cpu->irqWanted && !g_cpu.flag_I);
+    if (pending) snes->cpu->intWanted = true;
+    return pending;
+}
+
 uint8_t bus_read8(uint8_t bank, uint16_t addr) {
     Snes *snes = snesrecomp_get_snes();
     if (!snes) return 0;
     uint32_t flat = ((uint32_t)bank << 16) | addr;
-    return snes_read(snes, flat);
+    return s_phase_active ? snes_cpuRead(snes, flat) : snes_read(snes, flat);
 }
 
 void bus_write8(uint8_t bank, uint16_t addr, uint8_t val) {
     Snes *snes = snesrecomp_get_snes();
     if (!snes) return;
     uint32_t flat = ((uint32_t)bank << 16) | addr;
-    snes_write(snes, flat, val);
+    if (s_phase_active) snes_cpuWrite(snes, flat, val);
+    else snes_write(snes, flat, val);
 
     /* Diagnostic: count/trace ALL CGRAM-data writes (CPU interp + recompiled C
      * both pass through here), to find non-interpreter CGRAM writers. */
@@ -83,7 +150,7 @@ void bus_write8(uint8_t bank, uint16_t addr, uint8_t val) {
      * Normally each step happens on successive CPU access cycles.
      * Since recompiled code bypasses the CPU, we call handleDma twice
      * to complete both steps immediately. */
-    if (addr == 0x420B || addr == 0x420C) {
+    if (!s_phase_active && (addr == 0x420B || addr == 0x420C)) {
         /* Diagnostic: log GPDMA channel params (esp. CGRAM-targeting) so the
          * race-start palette-corrupting transfer can be identified. */
         if (addr == 0x420B && getenv("SMK_DMA_DEBUG")) {
@@ -126,12 +193,14 @@ void bus_write16(uint8_t bank, uint16_t addr, uint16_t val) {
 uint8_t bus_wram_read8(uint32_t offset) {
     Snes *snes = snesrecomp_get_snes();
     if (!snes) return 0;
+    if (s_phase_active) phase_advance(8);
     return snes->ram[offset & 0x1FFFF];
 }
 
 void bus_wram_write8(uint32_t offset, uint8_t val) {
     Snes *snes = snesrecomp_get_snes();
     if (!snes) return;
+    if (s_phase_active) phase_advance(8);
     snes->ram[offset & 0x1FFFF] = val;
 }
 

@@ -84,5 +84,6 @@ void recomp_timed_profile_dump(int top);
  * than RTS/RTL: call this from the body instead of returning normally, and the
  * timed-recomp hook will transfer control to snes_addr (no stack pop). */
 void recomp_set_redirect(uint32_t snes_addr);
+bool recomp_redirect_pending(void);
 
 #endif /* SNESRECOMP_FUNC_TABLE_H */

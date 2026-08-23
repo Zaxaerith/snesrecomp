@@ -361,6 +361,7 @@ unsigned long recomp_timed_intercept_hits(void) { return s_intercept_hits; }
  * hook then sets PB:PC to the target (no stack pop), matching the jump. */
 static uint32_t s_redirect = 0xFFFFFFFFu;   /* sentinel = no redirect */
 void recomp_set_redirect(uint32_t snes_addr) { s_redirect = snes_addr; }
+bool recomp_redirect_pending(void) { return s_redirect != 0xFFFFFFFFu; }
 
 /* --- Call-target profiler (Phase-3 target finding) -----------------------
  * When enabled, tallies the target of every direct JSR/JSL the timed CPU
