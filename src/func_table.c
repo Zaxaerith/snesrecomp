@@ -67,7 +67,10 @@ snes_func_t func_table_lookup(uint32_t snes_addr) {
     return NULL;
 }
 
-static bool func_table_dispatch(uint32_t snes_addr, bool is_long) {
+static bool func_table_dispatch(uint32_t snes_addr, bool is_long,
+                                const recomp_call_frame_t *frame,
+                                bool *frame_consumed) {
+    if (frame_consumed) *frame_consumed = false;
     int maxd = recomp_max_depth();
     /* Below the depth limit, run the native recompiled body (C call). At/above
      * it, fall through to the interpreter so deep/cyclic dispatch unwinds on the
@@ -82,12 +85,29 @@ static bool func_table_dispatch(uint32_t snes_addr, bool is_long) {
         }
     }
     if (recomp_interp_enabled()) {
-        recomp_interp_call(snes_addr, is_long);
+        if (frame) {
+            recomp_interp_call_with_frame(snes_addr, is_long, frame);
+            if (frame_consumed) *frame_consumed = frame->frame_bytes != 0;
+        } else {
+            recomp_interp_call(snes_addr, is_long);
+        }
         return true;
     }
     fprintf(stderr, "func_table: no function at $%06X\n", snes_addr);
     return false;
 }
 
-bool func_table_call(uint32_t snes_addr)     { return func_table_dispatch(snes_addr, true);  }
-bool func_table_call_jsr(uint32_t snes_addr) { return func_table_dispatch(snes_addr, false); }
+bool func_table_call(uint32_t snes_addr) {
+    return func_table_dispatch(snes_addr, true, NULL, NULL);
+}
+
+bool func_table_call_jsr(uint32_t snes_addr) {
+    return func_table_dispatch(snes_addr, false, NULL, NULL);
+}
+
+bool func_table_call_with_frame(uint32_t snes_addr, bool is_long,
+                                const recomp_call_frame_t *frame) {
+    bool frame_consumed = false;
+    (void)func_table_dispatch(snes_addr, is_long, frame, &frame_consumed);
+    return frame_consumed;
+}

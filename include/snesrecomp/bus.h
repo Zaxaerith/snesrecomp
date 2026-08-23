@@ -41,6 +41,23 @@ void     recomp_phase_begin(int aggregate_cycles, uint8_t bank, uint16_t pc,
                             int instruction_bytes);
 void     recomp_phase_end(int internal_cycles, int synthetic_stack_accesses);
 bool     recomp_phase_interrupt_pending(void);
+typedef struct recomp_call_frame {
+    uint16_t caller_sp;
+    uint8_t  return_bank;
+    uint8_t  frame_bytes;
+    bool     is_long;
+} recomp_call_frame_t;
+/* Enter always applies JSL's target PB. Bus-phase mode additionally
+ * materializes the native JSR/JSL return frame and records its original SP.
+ * A redirected call keeps that frame live so ROM execution can resume inside
+ * the callee. On a normal return, leave either emulates the native pull or does
+ * nothing when an interpreter fallback already consumed the physical frame. */
+recomp_call_frame_t recomp_phase_call_enter(uint16_t return_pc,
+                                             uint8_t return_bank,
+                                             uint8_t target_bank,
+                                             bool is_long);
+void     recomp_phase_call_leave(recomp_call_frame_t frame,
+                                 bool frame_consumed);
 
 /* Direct WRAM access (faster than bus routing for stack/DP operations) */
 uint8_t  bus_wram_read8(uint32_t offset);

@@ -24,6 +24,9 @@ extern Snes *snesrecomp_get_snes(void);
 
 static int s_phase_mode = -1;
 static bool s_phase_active = false;
+static uint32_t s_phase_frame_at_begin = 0;
+static bool s_phase_vblank_at_begin = false;
+static uint32_t s_phase_pc = 0;
 
 static bool phase_mode(void) {
     if (s_phase_mode < 0) {
@@ -71,6 +74,9 @@ void recomp_phase_begin(int aggregate_cycles, uint8_t bank, uint16_t pc,
     Snes *snes = snesrecomp_get_snes();
     if (!snes) return;
     s_phase_active = true;
+    s_phase_frame_at_begin = snes->frames;
+    s_phase_vblank_at_begin = snes->inVblank;
+    s_phase_pc = ((uint32_t)bank << 16) | pc;
     for (int i = 0; i < instruction_bytes; i++)
         (void)snes_cpuRead(snes, ((uint32_t)bank << 16) | (uint16_t)(pc + i));
 }
@@ -89,23 +95,89 @@ void recomp_phase_end(int internal_cycles, int synthetic_stack_accesses) {
     s_phase_active = false;
 }
 
+static void phase_stack_dec(void) {
+    g_cpu.S--;
+    if (g_cpu.flag_E) g_cpu.S = (uint16_t)((g_cpu.S & 0x00FF) | 0x0100);
+}
+
+static void phase_stack_inc(void) {
+    g_cpu.S++;
+    if (g_cpu.flag_E) g_cpu.S = (uint16_t)((g_cpu.S & 0x00FF) | 0x0100);
+}
+
+recomp_call_frame_t recomp_phase_call_enter(uint16_t return_pc,
+                                             uint8_t return_bank,
+                                             uint8_t target_bank,
+                                             bool is_long) {
+    recomp_call_frame_t frame = {
+        g_cpu.S, return_bank, 0, is_long
+    };
+    if (!phase_mode()) {
+        if (is_long) g_cpu.PB = target_bank;
+        return frame;
+    }
+    /* JSR: operand fetches, idle, push return high then low.
+     * JSL additionally pushes PB. The current prototype fetches the long-bank
+     * operand with the other opcode bytes, so PB is materialized here. */
+    if (is_long) {
+        bus_wram_write8(g_cpu.S, return_bank);
+        phase_stack_dec();
+    }
+    {
+        Snes *snes = snesrecomp_get_snes();
+        if (snes) snes_cpuIdle(snes, false);
+    }
+    bus_wram_write8(g_cpu.S, (uint8_t)(return_pc >> 8));
+    phase_stack_dec();
+    bus_wram_write8(g_cpu.S, (uint8_t)return_pc);
+    phase_stack_dec();
+    if (is_long) g_cpu.PB = target_bank;
+    s_phase_active = false;
+    frame.frame_bytes = is_long ? 3 : 2;
+    return frame;
+}
+
+void recomp_phase_call_leave(recomp_call_frame_t frame,
+                             bool frame_consumed) {
+    if (frame_consumed) return;
+    uint8_t frame_bytes = frame.frame_bytes;
+    while (frame_bytes-- > 0) phase_stack_inc();
+    if (frame.is_long) {
+        g_cpu.PB = frame.frame_bytes
+            ? bus_wram_read8(g_cpu.S)
+            : frame.return_bank;
+    }
+}
+
 bool recomp_phase_interrupt_pending(void) {
     if (!phase_mode()) return false;
-    /* Yielding out of a nested native JSR also requires materializing that
-     * JSR's return address on the emulated stack. Keep the protocol opt-in
-     * until every generated call form does so; phase timing itself is safe. */
+    Snes *snes = snesrecomp_get_snes();
+    if (!snes || !snes->cpu) return false;
+    bool pending = snes->cpu->nmiWanted ||
+                   (snes->cpu->irqWanted && !g_cpu.flag_I);
+    bool frame_boundary = snes->frames != s_phase_frame_at_begin;
+    bool vblank_boundary = !s_phase_vblank_at_begin && snes->inVblank;
+    if (getenv("SMK_RECOMP_PHASE_DEBUG") &&
+        (frame_boundary || vblank_boundary ||
+         (s_phase_pc == 0x81F687 && snes->vPos >= 220))) {
+        fprintf(stderr, "[PHASE] pc=%06X frame=%u v=%u h=%u vb=%d start_vb=%d boundary=%d\n",
+                s_phase_pc, snes->frames, snes->vPos, snes->hPos,
+                snes->inVblank, s_phase_vblank_at_begin,
+                frame_boundary || vblank_boundary);
+    }
+    /* Latching and yielding are distinct. LakeSnes checkInt always updates
+     * intWanted at its documented instruction phase even when this prototype
+     * elects to finish the native function before handing control back. */
+    if (pending) snes->cpu->intWanted = true;
+
     static int yield_on = -1;
     if (yield_on < 0) {
         const char *e = getenv("SMK_RECOMP_PHASE_YIELD");
         yield_on = e ? atoi(e) != 0 : 0;
     }
-    if (!yield_on) return false;
-    Snes *snes = snesrecomp_get_snes();
-    if (!snes || !snes->cpu) return false;
-    bool pending = snes->cpu->nmiWanted ||
-                   (snes->cpu->irqWanted && !g_cpu.flag_I);
-    if (pending) snes->cpu->intWanted = true;
-    return pending;
+    /* snes_runFrame can only observe completion after the native hook returns.
+     * Never let one C body run instructions belonging to the next video frame. */
+    return frame_boundary || vblank_boundary || (yield_on && pending);
 }
 
 uint8_t bus_read8(uint8_t bank, uint16_t addr) {

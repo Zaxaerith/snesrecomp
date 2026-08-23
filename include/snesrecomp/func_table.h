@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "snesrecomp/bus.h"
 
 /* All recompiled functions: no args, no return, use globals */
 typedef void (*snes_func_t)(void);
@@ -37,6 +38,14 @@ snes_func_t func_table_lookup(uint32_t snes_addr);
 bool func_table_call(uint32_t snes_addr);
 bool func_table_call_jsr(uint32_t snes_addr);
 
+/* Generated calls carry a token even when bus-phase timing is disabled. This
+ * entry preserves pending interrupt state for either mode and, when the token
+ * owns a physical 65816 return frame, prevents fallback from pushing a second
+ * sentinel. It returns true only when fallback consumed that physical frame;
+ * native C callees leave it for the caller. */
+bool func_table_call_with_frame(uint32_t snes_addr, bool is_long,
+                                const recomp_call_frame_t *frame);
+
 /*
  * Interpreter fallback: run original ROM code on the LakeSnes CPU for a
  * subroutine that has not been recompiled. is_long selects RTL (JSL) vs
@@ -44,6 +53,8 @@ bool func_table_call_jsr(uint32_t snes_addr);
  * side effects) so it composes with snesrecomp's manual frame model.
  */
 void recomp_interp_call(uint32_t snes_addr, bool is_long);
+void recomp_interp_call_with_frame(uint32_t snes_addr, bool is_long,
+                                   const recomp_call_frame_t *frame);
 void recomp_interp_set_enabled(bool enabled);
 bool recomp_interp_enabled(void);
 

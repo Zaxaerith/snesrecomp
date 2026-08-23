@@ -176,7 +176,13 @@ static void sync_from_lake(Cpu *c) {
  * for NMI (which we drive externally) would otherwise loop forever. */
 #define INTERP_MAX_OPS 20000000L
 
-void recomp_interp_call(uint32_t snes_addr, bool is_long) {
+/* Interpreter fallback is entered from inside the timed opcode hook. Suspend
+ * that hook while executing the ROM body or force/depth fallback would simply
+ * re-enter the same native function at its first opcode. */
+extern bool (*g_cpuRecompHook)(Cpu*);
+
+static void recomp_interp_call_impl(uint32_t snes_addr, bool is_long,
+                                    const recomp_call_frame_t *frame) {
     Snes *snes = snesrecomp_get_snes();
     if (!snes || !snes->cpu) return;
     Cpu *c = snes->cpu;
@@ -193,29 +199,43 @@ void recomp_interp_call(uint32_t snes_addr, bool is_long) {
 
     sync_to_lake(c);
 
+    bool (*saved_recomp_hook)(Cpu*) = g_cpuRecompHook;
+    g_cpuRecompHook = NULL;
+
     /* No interrupts/halt may interfere: the recomp drives NMI itself, and we
      * never advance timing here so none would fire anyway. */
+    bool generated_context = frame != NULL;
+    bool deferred_int_wanted = c->intWanted;
+    bool saved_reset_wanted = c->resetWanted;
     c->waiting     = false;
     c->stopped     = false;
-    c->nmiWanted   = false;
     c->intWanted   = false;
-    c->irqWanted   = false;
     c->resetWanted = false;
+    if (!generated_context) {
+        /* Preserve the legacy manual-frame behavior. Generated calls instead
+         * keep the live NMI latch and IRQ level so fallback register accesses
+         * can legitimately change them. intWanted is suppressed per opcode. */
+        c->nmiWanted = false;
+        c->irqWanted = false;
+    }
 
-    uint16_t start_sp = c->sp;
+    bool physical_frame = frame && frame->frame_bytes;
+    uint16_t start_sp = physical_frame ? frame->caller_sp : c->sp;
 
     /* Push a sentinel return frame. The values don't matter — completion is
      * detected purely by the stack pointer climbing back to start_sp when the
      * routine's terminating RTL/RTS pulls these bytes. JSL pushes a 24-bit
      * return (bank + 16-bit PC); JSR pushes a 16-bit return. */
-    if (is_long) {
-        bus_write8(0x00, c->sp, 0x00);  /* return bank */
+    if (!physical_frame) {
+        if (is_long) {
+            bus_write8(0x00, c->sp, 0x00);  /* return bank */
+            c->sp--;
+        }
+        bus_write8(0x00, c->sp, 0xFF);       /* return PC high */
+        c->sp--;
+        bus_write8(0x00, c->sp, 0xFF);       /* return PC low */
         c->sp--;
     }
-    bus_write8(0x00, c->sp, 0xFF);       /* return PC high */
-    c->sp--;
-    bus_write8(0x00, c->sp, 0xFF);       /* return PC low */
-    c->sp--;
 
     c->k  = (snes_addr >> 16) & 0xFF;
     c->pc = (uint16_t)snes_addr;
@@ -263,7 +283,11 @@ void recomp_interp_call(uint32_t snes_addr, bool is_long) {
     bool dma_guard_pending = false;
     uint16_t dma_guard_sp = 0;
 
-    while ((int16_t)(start_sp - c->sp) > 0) {
+    while (c->sp != start_sp) {
+        if (generated_context) {
+            deferred_int_wanted |= c->intWanted;
+            c->intWanted = false;
+        }
         if (c->intWanted && !dma_guard_pending) {
             memcpy(saved_dma, snes->dma->channel, sizeof(saved_dma));
             dma_guard_sp = c->sp;       /* RTI will return SP to here */
@@ -312,7 +336,19 @@ void recomp_interp_call(uint32_t snes_addr, bool is_long) {
     /* On abort, the routine left an unbalanced stack. Restore the entry stack
      * pointer so the bailout doesn't leak frames into subsequent calls (which
      * would otherwise drift the stack down until it corrupts WRAM/overflows). */
-    if (aborted) c->sp = start_sp;
+    if (aborted) {
+        c->sp = start_sp;
+        if (physical_frame && is_long) c->k = frame->return_bank;
+    }
+
+    /* Keep the final live NMI/IRQ state produced by fallback register accesses.
+     * Merge only the previously sampled interrupt latch; unlike irqWanted this
+     * is not a hardware level the callee can legitimately clear. */
+    if (generated_context) {
+        deferred_int_wanted |= c->intWanted;
+        c->intWanted = deferred_int_wanted;
+        c->resetWanted = saved_reset_wanted;
+    }
 
     sync_from_lake(c);
 
@@ -321,6 +357,16 @@ void recomp_interp_call(uint32_t snes_addr, bool is_long) {
     c->read  = saved_read;
     c->write = saved_write;
     c->idle  = saved_idle;
+    g_cpuRecompHook = saved_recomp_hook;
+}
+
+void recomp_interp_call(uint32_t snes_addr, bool is_long) {
+    recomp_interp_call_impl(snes_addr, is_long, NULL);
+}
+
+void recomp_interp_call_with_frame(uint32_t snes_addr, bool is_long,
+                                   const recomp_call_frame_t *frame) {
+    recomp_interp_call_impl(snes_addr, is_long, frame);
 }
 
 /* ===== Phase-1 timed-recomp interception ==================================
@@ -336,8 +382,6 @@ void recomp_interp_call(uint32_t snes_addr, bool is_long) {
  * genuine code's next vblank spin-wait (which keeps stepping the timed CPU
  * until the PPU actually reaches vblank), so ordinary (non-raster-timed)
  * routines need no per-function cycle accounting. */
-
-extern bool (*g_cpuRecompHook)(Cpu*);
 
 typedef struct { uint32_t addr; bool is_long; } TimedIntercept;
 static TimedIntercept s_intercepts[128];
