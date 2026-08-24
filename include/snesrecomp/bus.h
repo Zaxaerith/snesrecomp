@@ -63,6 +63,12 @@ recomp_call_frame_t recomp_phase_call_enter(uint16_t return_pc,
                                              uint8_t target_bank,
                                              bool is_long,
                                              bool check_return_push);
+/* JSR (abs,X) has a unique sequence: fetch opcode+operand-low, push the
+ * return word, fetch operand-high, idle, then read/check/read the table. This
+ * helper performs the middle segment and deliberately leaves the phase open
+ * for the generated table reads. */
+recomp_call_frame_t recomp_phase_call_enter_indirect(uint16_t return_pc,
+                                                      uint8_t return_bank);
 void     recomp_phase_call_leave(recomp_call_frame_t frame,
                                  bool frame_consumed);
 

@@ -153,9 +153,10 @@ recomp_call_frame_t recomp_phase_call_enter(uint16_t return_pc,
         if (is_long) g_cpu.PB = target_bank;
         return frame;
     }
-    /* JSR: operand fetches, idle, push return high then low.
-     * JSL additionally pushes PB. The current prototype fetches the long-bank
-     * operand with the other opcode bytes, so PB is materialized here. */
+    /* JSR: operand fetches, idle, push return high/check/low.
+     * JSL: fetch address word, push PB, idle, fetch the bank operand, then
+     * push return high/check/low. Its bank byte is deliberately not fetched
+     * by recomp_phase_begin so this helper can preserve the native order. */
     if (is_long) {
         recomp_stack_push8(return_bank);
     }
@@ -163,10 +164,36 @@ recomp_call_frame_t recomp_phase_call_enter(uint16_t return_pc,
         Snes *snes = snesrecomp_get_snes();
         if (snes) snes_cpuIdle(snes, false);
     }
+    if (is_long) {
+        Snes *snes = snesrecomp_get_snes();
+        if (snes)
+            (void)snes_cpuRead(snes, ((uint32_t)return_bank << 16) | return_pc);
+    }
     recomp_stack_push16(return_pc, check_return_push);
     if (is_long) g_cpu.PB = target_bank;
     s_phase_active = false;
     frame.frame_bytes = is_long ? 3 : 2;
+    return frame;
+}
+
+recomp_call_frame_t recomp_phase_call_enter_indirect(uint16_t return_pc,
+                                                      uint8_t return_bank) {
+    recomp_call_frame_t frame = {
+        g_cpu.S, return_bank, 0, false
+    };
+    if (!phase_mode()) return frame;
+
+    /* LakeSnes JSR (abs,X): after opcode+operand-low have been fetched, push
+     * the current PC without an interrupt check, fetch operand-high, then
+     * idle. The caller performs the checked low/high jump-table reads. */
+    recomp_stack_push16(return_pc, false);
+    {
+        Snes *snes = snesrecomp_get_snes();
+        if (snes)
+            (void)snes_cpuRead(snes, ((uint32_t)return_bank << 16) | return_pc);
+    }
+    recomp_phase_idle(6);
+    frame.frame_bytes = 2;
     return frame;
 }
 
