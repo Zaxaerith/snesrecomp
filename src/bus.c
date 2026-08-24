@@ -100,6 +100,11 @@ void recomp_phase_idle(int master_cycles) {
     if (master_cycles > 0) phase_advance(master_cycles);
 }
 
+void recomp_phase_penalty(int master_cycles) {
+    if (phase_mode()) recomp_phase_idle(master_cycles);
+    else recomp_tick(master_cycles);
+}
+
 void recomp_phase_end(int internal_cycles, int synthetic_stack_accesses) {
     if (!phase_mode()) return;
     /* Synthetic accesses account for RTS/RTL stack pulls performed later by

@@ -43,6 +43,10 @@ void     recomp_phase_begin_checked(int aggregate_cycles, uint8_t bank,
                                     uint16_t pc, int instruction_bytes,
                                     int check_after_fetches);
 void     recomp_phase_idle(int master_cycles);
+/* Addressing-mode penalty: a real idle in bus-phase mode, or an aggregate
+ * tick otherwise. Use for runtime-dependent DP/page/index penalties that
+ * cannot be folded into recomp_phase_begin's static cycle count. */
+void     recomp_phase_penalty(int master_cycles);
 void     recomp_phase_check_int(void);
 void     recomp_phase_end(int internal_cycles, int synthetic_stack_accesses);
 void     recomp_phase_return(bool is_long);
