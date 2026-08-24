@@ -39,7 +39,13 @@ void     recomp_tick(int cycles);
  * phases. Without the flag, begin is exactly the legacy aggregate tick. */
 void     recomp_phase_begin(int aggregate_cycles, uint8_t bank, uint16_t pc,
                             int instruction_bytes);
+void     recomp_phase_begin_checked(int aggregate_cycles, uint8_t bank,
+                                    uint16_t pc, int instruction_bytes,
+                                    int check_after_fetches);
+void     recomp_phase_idle(int master_cycles);
+void     recomp_phase_check_int(void);
 void     recomp_phase_end(int internal_cycles, int synthetic_stack_accesses);
+void     recomp_phase_return(bool is_long);
 bool     recomp_phase_interrupt_pending(void);
 typedef struct recomp_call_frame {
     uint16_t caller_sp;
@@ -55,9 +61,26 @@ typedef struct recomp_call_frame {
 recomp_call_frame_t recomp_phase_call_enter(uint16_t return_pc,
                                              uint8_t return_bank,
                                              uint8_t target_bank,
-                                             bool is_long);
+                                             bool is_long,
+                                             bool check_return_push);
 void     recomp_phase_call_leave(recomp_call_frame_t frame,
                                  bool frame_consumed);
+
+/* Timed native-stack primitives. Word operations follow the 65C816 byte
+ * order and optionally perform LakeSnes's checkInt between the two bytes. */
+void     recomp_stack_push8(uint8_t value);
+uint8_t  recomp_stack_pull8(void);
+void     recomp_stack_push16(uint16_t value, bool check_between);
+uint16_t recomp_stack_pull16(bool check_between);
+
+/* Data accesses whose checkInt point is immediately before an 8-bit access
+ * or between the low/high bytes of a 16-bit access. */
+uint8_t  bus_read8_checked(uint8_t bank, uint16_t addr);
+void     bus_write8_checked(uint8_t bank, uint16_t addr, uint8_t val);
+uint16_t bus_read16_checked(uint8_t bank, uint16_t addr);
+void     bus_write16_checked(uint8_t bank, uint16_t addr, uint16_t val);
+void     bus_write16_reversed_checked(uint8_t bank, uint16_t addr,
+                                      uint16_t val);
 
 /* Direct WRAM access (faster than bus routing for stack/DP operations) */
 uint8_t  bus_wram_read8(uint32_t offset);

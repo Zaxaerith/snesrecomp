@@ -64,8 +64,9 @@ void recomp_tick(int cycles) {
     snes_runCycles(snes, cycles);
 }
 
-void recomp_phase_begin(int aggregate_cycles, uint8_t bank, uint16_t pc,
-                        int instruction_bytes) {
+void recomp_phase_begin_checked(int aggregate_cycles, uint8_t bank,
+                                uint16_t pc, int instruction_bytes,
+                                int check_after_fetches) {
     if (!phase_mode()) {
         s_phase_active = false;
         recomp_tick(aggregate_cycles);
@@ -77,8 +78,26 @@ void recomp_phase_begin(int aggregate_cycles, uint8_t bank, uint16_t pc,
     s_phase_frame_at_begin = snes->frames;
     s_phase_vblank_at_begin = snes->inVblank;
     s_phase_pc = ((uint32_t)bank << 16) | pc;
-    for (int i = 0; i < instruction_bytes; i++)
+    for (int i = 0; i < instruction_bytes; i++) {
         (void)snes_cpuRead(snes, ((uint32_t)bank << 16) | (uint16_t)(pc + i));
+        if (i + 1 == check_after_fetches) recomp_phase_check_int();
+    }
+}
+
+void recomp_phase_begin(int aggregate_cycles, uint8_t bank, uint16_t pc,
+                        int instruction_bytes) {
+    recomp_phase_begin_checked(aggregate_cycles, bank, pc,
+                               instruction_bytes, -1);
+}
+
+void recomp_phase_idle(int master_cycles) {
+    if (!phase_mode()) return;
+    while (master_cycles >= 6) {
+        Snes *snes = snesrecomp_get_snes();
+        if (snes) snes_cpuIdle(snes, false);
+        master_cycles -= 6;
+    }
+    if (master_cycles > 0) phase_advance(master_cycles);
 }
 
 void recomp_phase_end(int internal_cycles, int synthetic_stack_accesses) {
@@ -86,12 +105,7 @@ void recomp_phase_end(int internal_cycles, int synthetic_stack_accesses) {
     /* Synthetic accesses account for RTS/RTL stack pulls performed later by
      * the interception hook without touching live stack bytes a second time. */
     for (int i = 0; i < synthetic_stack_accesses; i++) phase_advance(8);
-    while (internal_cycles >= 6) {
-        Snes *snes = snesrecomp_get_snes();
-        if (snes) snes_cpuIdle(snes, false);
-        internal_cycles -= 6;
-    }
-    if (internal_cycles > 0) phase_advance(internal_cycles);
+    recomp_phase_idle(internal_cycles);
     s_phase_active = false;
 }
 
@@ -105,10 +119,33 @@ static void phase_stack_inc(void) {
     if (g_cpu.flag_E) g_cpu.S = (uint16_t)((g_cpu.S & 0x00FF) | 0x0100);
 }
 
+void recomp_stack_push8(uint8_t value) {
+    bus_wram_write8(g_cpu.S, value);
+    phase_stack_dec();
+}
+
+uint8_t recomp_stack_pull8(void) {
+    phase_stack_inc();
+    return bus_wram_read8(g_cpu.S);
+}
+
+void recomp_stack_push16(uint16_t value, bool check_between) {
+    recomp_stack_push8((uint8_t)(value >> 8));
+    if (check_between) recomp_phase_check_int();
+    recomp_stack_push8((uint8_t)value);
+}
+
+uint16_t recomp_stack_pull16(bool check_between) {
+    uint8_t low = recomp_stack_pull8();
+    if (check_between) recomp_phase_check_int();
+    return (uint16_t)(low | ((uint16_t)recomp_stack_pull8() << 8));
+}
+
 recomp_call_frame_t recomp_phase_call_enter(uint16_t return_pc,
                                              uint8_t return_bank,
                                              uint8_t target_bank,
-                                             bool is_long) {
+                                             bool is_long,
+                                             bool check_return_push) {
     recomp_call_frame_t frame = {
         g_cpu.S, return_bank, 0, is_long
     };
@@ -120,21 +157,30 @@ recomp_call_frame_t recomp_phase_call_enter(uint16_t return_pc,
      * JSL additionally pushes PB. The current prototype fetches the long-bank
      * operand with the other opcode bytes, so PB is materialized here. */
     if (is_long) {
-        bus_wram_write8(g_cpu.S, return_bank);
-        phase_stack_dec();
+        recomp_stack_push8(return_bank);
     }
     {
         Snes *snes = snesrecomp_get_snes();
         if (snes) snes_cpuIdle(snes, false);
     }
-    bus_wram_write8(g_cpu.S, (uint8_t)(return_pc >> 8));
-    phase_stack_dec();
-    bus_wram_write8(g_cpu.S, (uint8_t)return_pc);
-    phase_stack_dec();
+    recomp_stack_push16(return_pc, check_return_push);
     if (is_long) g_cpu.PB = target_bank;
     s_phase_active = false;
     frame.frame_bytes = is_long ? 3 : 2;
     return frame;
+}
+
+void recomp_phase_return(bool is_long) {
+    if (!phase_mode()) return;
+    /* LakeSnes: RTS = idle, idle, pull lo/hi, checkInt, idle.
+     * RTL = idle, idle, pull lo/hi, checkInt, pull PB. The interception hook
+     * performs the architectural pulls, so these are timing-only accesses. */
+    recomp_phase_idle(12);
+    phase_advance(16);
+    recomp_phase_check_int();
+    if (is_long) phase_advance(8);
+    else recomp_phase_idle(6);
+    s_phase_active = false;
 }
 
 void recomp_phase_call_leave(recomp_call_frame_t frame,
@@ -149,12 +195,20 @@ void recomp_phase_call_leave(recomp_call_frame_t frame,
     }
 }
 
+void recomp_phase_check_int(void) {
+    if (!phase_mode()) return;
+    Snes *snes = snesrecomp_get_snes();
+    if (!snes || !snes->cpu) return;
+    bool pending = snes->cpu->nmiWanted ||
+                   (snes->cpu->irqWanted && !g_cpu.flag_I);
+    snes->cpu->intWanted = pending;
+}
+
 bool recomp_phase_interrupt_pending(void) {
     if (!phase_mode()) return false;
     Snes *snes = snesrecomp_get_snes();
     if (!snes || !snes->cpu) return false;
-    bool pending = snes->cpu->nmiWanted ||
-                   (snes->cpu->irqWanted && !g_cpu.flag_I);
+    bool pending = snes->cpu->intWanted;
     bool frame_boundary = snes->frames != s_phase_frame_at_begin;
     bool vblank_boundary = !s_phase_vblank_at_begin && snes->inVblank;
     if (getenv("SMK_RECOMP_PHASE_DEBUG") &&
@@ -165,11 +219,6 @@ bool recomp_phase_interrupt_pending(void) {
                 snes->inVblank, s_phase_vblank_at_begin,
                 frame_boundary || vblank_boundary);
     }
-    /* Latching and yielding are distinct. LakeSnes checkInt always updates
-     * intWanted at its documented instruction phase even when this prototype
-     * elects to finish the native function before handing control back. */
-    if (pending) snes->cpu->intWanted = true;
-
     static int yield_on = -1;
     if (yield_on < 0) {
         const char *e = getenv("SMK_RECOMP_PHASE_YIELD");
@@ -185,6 +234,11 @@ uint8_t bus_read8(uint8_t bank, uint16_t addr) {
     if (!snes) return 0;
     uint32_t flat = ((uint32_t)bank << 16) | addr;
     return s_phase_active ? snes_cpuRead(snes, flat) : snes_read(snes, flat);
+}
+
+uint8_t bus_read8_checked(uint8_t bank, uint16_t addr) {
+    recomp_phase_check_int();
+    return bus_read8(bank, addr);
 }
 
 void bus_write8(uint8_t bank, uint16_t addr, uint8_t val) {
@@ -239,6 +293,11 @@ void bus_write8(uint8_t bank, uint16_t addr, uint8_t val) {
     }
 }
 
+void bus_write8_checked(uint8_t bank, uint16_t addr, uint8_t val) {
+    recomp_phase_check_int();
+    bus_write8(bank, addr, val);
+}
+
 uint16_t bus_read16(uint8_t bank, uint16_t addr) {
     uint8_t lo = bus_read8(bank, addr);
     uint16_t next_addr = addr + 1;
@@ -250,6 +309,15 @@ uint16_t bus_read16(uint8_t bank, uint16_t addr) {
     return (uint16_t)(lo | (hi << 8));
 }
 
+uint16_t bus_read16_checked(uint8_t bank, uint16_t addr) {
+    uint8_t lo = bus_read8(bank, addr);
+    uint16_t next_addr = (uint16_t)(addr + 1);
+    uint8_t next_bank = bank;
+    if (next_addr == 0x0000) next_bank++;
+    recomp_phase_check_int();
+    return (uint16_t)(lo | ((uint16_t)bus_read8(next_bank, next_addr) << 8));
+}
+
 void bus_write16(uint8_t bank, uint16_t addr, uint16_t val) {
     bus_write8(bank, addr, (uint8_t)(val & 0xFF));
     uint16_t next_addr = addr + 1;
@@ -258,6 +326,24 @@ void bus_write16(uint8_t bank, uint16_t addr, uint16_t val) {
         next_bank++;
     }
     bus_write8(next_bank, next_addr, (uint8_t)(val >> 8));
+}
+
+void bus_write16_checked(uint8_t bank, uint16_t addr, uint16_t val) {
+    bus_write8(bank, addr, (uint8_t)val);
+    uint16_t next_addr = (uint16_t)(addr + 1);
+    uint8_t next_bank = bank;
+    if (next_addr == 0x0000) next_bank++;
+    recomp_phase_check_int();
+    bus_write8(next_bank, next_addr, (uint8_t)(val >> 8));
+}
+
+void bus_write16_reversed_checked(uint8_t bank, uint16_t addr, uint16_t val) {
+    uint16_t next_addr = (uint16_t)(addr + 1);
+    uint8_t next_bank = bank;
+    if (next_addr == 0x0000) next_bank++;
+    bus_write8(next_bank, next_addr, (uint8_t)(val >> 8));
+    recomp_phase_check_int();
+    bus_write8(bank, addr, (uint8_t)val);
 }
 
 /* --- Direct WRAM access (bypass bus for speed) --- */
