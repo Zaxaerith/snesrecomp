@@ -82,6 +82,17 @@ static inline void cpu_set_p(uint8_t p) {
     g_cpu.flag_M = (p & 0x20) != 0;
     g_cpu.flag_V = (p & 0x40) != 0;
     g_cpu.flag_N = (p & 0x80) != 0;
+    /* In emulation mode M/X are fixed high.  Entering 8-bit index mode also
+     * clears the hidden high bytes immediately (PLP/RTI/REP/SEP semantics). */
+    if (g_cpu.flag_E) {
+        g_cpu.flag_M = true;
+        g_cpu.flag_X = true;
+        g_cpu.S = (uint16_t)((g_cpu.S & 0x00FF) | 0x0100);
+    }
+    if (g_cpu.flag_X) {
+        g_cpu.X &= 0x00FF;
+        g_cpu.Y &= 0x00FF;
+    }
 }
 
 /* Reset CPU to power-on state (emulation mode) */
