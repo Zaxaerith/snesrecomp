@@ -360,4 +360,222 @@ static inline void op_plb(void) {
     cpu_update_nz8(g_cpu.DB);
 }
 
+
+/* ========== Extended op set (contributed from the Mario Paint recomp) ========== */
+
+static inline void op_lda_long8(uint8_t bank, uint16_t addr) {
+    uint8_t val = bus_read8(bank, addr);
+    CPU_SET_A8(val);
+    cpu_update_nz8(val);
+}
+
+static inline void op_ldy_imm8(uint8_t val) {
+    g_cpu.Y = val;
+    cpu_update_nz8(val);
+}
+
+static inline void op_stx_abs8(uint16_t addr) {
+    bus_write8(g_cpu.DB, addr, (uint8_t)g_cpu.X);
+}
+
+static inline void op_sty_abs8(uint16_t addr) {
+    bus_write8(g_cpu.DB, addr, (uint8_t)g_cpu.Y);
+}
+
+static inline void op_txy(void) {
+    g_cpu.Y = g_cpu.X;
+    if (g_cpu.flag_X) cpu_update_nz8((uint8_t)g_cpu.Y);
+    else cpu_update_nz16(g_cpu.Y);
+}
+
+static inline void op_tyx(void) {
+    g_cpu.X = g_cpu.Y;
+    if (g_cpu.flag_X) cpu_update_nz8((uint8_t)g_cpu.X);
+    else cpu_update_nz16(g_cpu.X);
+}
+
+static inline void op_inc_a8(void) {
+    uint8_t val = CPU_A8() + 1;
+    CPU_SET_A8(val);
+    cpu_update_nz8(val);
+}
+
+static inline void op_inc_a16(void) {
+    uint16_t val = CPU_A16() + 1;
+    CPU_SET_A16(val);
+    cpu_update_nz16(val);
+}
+
+static inline void op_inx(void) {
+    g_cpu.X = g_cpu.flag_X ? ((g_cpu.X + 1) & 0xFF) : (g_cpu.X + 1);
+    if (g_cpu.flag_X) cpu_update_nz8((uint8_t)g_cpu.X);
+    else cpu_update_nz16(g_cpu.X);
+}
+
+static inline void op_iny(void) {
+    g_cpu.Y = g_cpu.flag_X ? ((g_cpu.Y + 1) & 0xFF) : (g_cpu.Y + 1);
+    if (g_cpu.flag_X) cpu_update_nz8((uint8_t)g_cpu.Y);
+    else cpu_update_nz16(g_cpu.Y);
+}
+
+static inline void op_dec_dp8(uint8_t dp) {
+    uint16_t addr = g_cpu.DP + dp;
+    uint8_t val = bus_wram_read8(addr) - 1;
+    bus_wram_write8(addr, val);
+    cpu_update_nz8(val);
+}
+
+static inline void op_dex(void) {
+    g_cpu.X = g_cpu.flag_X ? ((g_cpu.X - 1) & 0xFF) : (g_cpu.X - 1);
+    if (g_cpu.flag_X) cpu_update_nz8((uint8_t)g_cpu.X);
+    else cpu_update_nz16(g_cpu.X);
+}
+
+static inline void op_dey(void) {
+    g_cpu.Y = g_cpu.flag_X ? ((g_cpu.Y - 1) & 0xFF) : (g_cpu.Y - 1);
+    if (g_cpu.flag_X) cpu_update_nz8((uint8_t)g_cpu.Y);
+    else cpu_update_nz16(g_cpu.Y);
+}
+
+static inline void op_cpx_imm8(uint8_t val) {
+    uint16_t result = (g_cpu.X & 0xFF) - val;
+    g_cpu.flag_C = ((g_cpu.X & 0xFF) >= val);
+    g_cpu.flag_Z = ((result & 0xFF) == 0);
+    g_cpu.flag_N = ((result & 0x80) != 0);
+}
+
+static inline void op_cpx_imm16(uint16_t val) {
+    uint32_t result = g_cpu.X - val;
+    g_cpu.flag_C = (g_cpu.X >= val);
+    g_cpu.flag_Z = ((result & 0xFFFF) == 0);
+    g_cpu.flag_N = ((result & 0x8000) != 0);
+}
+
+static inline void op_cpy_imm8(uint8_t val) {
+    uint16_t result = (g_cpu.Y & 0xFF) - val;
+    g_cpu.flag_C = ((g_cpu.Y & 0xFF) >= val);
+    g_cpu.flag_Z = ((result & 0xFF) == 0);
+    g_cpu.flag_N = ((result & 0x80) != 0);
+}
+
+static inline void op_cpy_imm16(uint16_t val) {
+    uint32_t result = g_cpu.Y - val;
+    g_cpu.flag_C = (g_cpu.Y >= val);
+    g_cpu.flag_Z = ((result & 0xFFFF) == 0);
+    g_cpu.flag_N = ((result & 0x8000) != 0);
+}
+
+static inline void op_adc_imm8(uint8_t val) {
+    uint16_t result = CPU_A8() + val + (g_cpu.flag_C ? 1 : 0);
+    g_cpu.flag_V = (~(CPU_A8() ^ val) & (CPU_A8() ^ (uint8_t)result) & 0x80) != 0;
+    g_cpu.flag_C = (result > 0xFF);
+    CPU_SET_A8((uint8_t)result);
+    cpu_update_nz8(CPU_A8());
+}
+
+static inline void op_sbc_imm8(uint8_t val) {
+    uint16_t result = CPU_A8() - val - (g_cpu.flag_C ? 0 : 1);
+    g_cpu.flag_V = ((CPU_A8() ^ val) & (CPU_A8() ^ (uint8_t)result) & 0x80) != 0;
+    g_cpu.flag_C = (result <= 0xFF);
+    CPU_SET_A8((uint8_t)result);
+    cpu_update_nz8(CPU_A8());
+}
+
+static inline void op_ora_imm8(uint8_t val) {
+    CPU_SET_A8(CPU_A8() | val);
+    cpu_update_nz8(CPU_A8());
+}
+
+static inline void op_ora_imm16(uint16_t val) {
+    CPU_SET_A16(CPU_A16() | val);
+    cpu_update_nz16(CPU_A16());
+}
+
+static inline void op_eor_imm8(uint8_t val) {
+    CPU_SET_A8(CPU_A8() ^ val);
+    cpu_update_nz8(CPU_A8());
+}
+
+static inline void op_eor_imm16(uint16_t val) {
+    CPU_SET_A16(CPU_A16() ^ val);
+    cpu_update_nz16(CPU_A16());
+}
+
+static inline void op_asl_a8(void) {
+    g_cpu.flag_C = (CPU_A8() & 0x80) != 0;
+    CPU_SET_A8(CPU_A8() << 1);
+    cpu_update_nz8(CPU_A8());
+}
+
+static inline void op_asl_a16(void) {
+    g_cpu.flag_C = (CPU_A16() & 0x8000) != 0;
+    CPU_SET_A16(CPU_A16() << 1);
+    cpu_update_nz16(CPU_A16());
+}
+
+static inline void op_lsr_a8(void) {
+    g_cpu.flag_C = (CPU_A8() & 1) != 0;
+    CPU_SET_A8(CPU_A8() >> 1);
+    cpu_update_nz8(CPU_A8());
+}
+
+static inline void op_lsr_a16(void) {
+    g_cpu.flag_C = (CPU_A16() & 1) != 0;
+    CPU_SET_A16(CPU_A16() >> 1);
+    cpu_update_nz16(CPU_A16());
+}
+
+static inline void op_rol_a8(void) {
+    uint8_t old_c = g_cpu.flag_C ? 1 : 0;
+    g_cpu.flag_C = (CPU_A8() & 0x80) != 0;
+    CPU_SET_A8((CPU_A8() << 1) | old_c);
+    cpu_update_nz8(CPU_A8());
+}
+
+static inline void op_ror_a8(void) {
+    uint8_t old_c = g_cpu.flag_C ? 0x80 : 0;
+    g_cpu.flag_C = (CPU_A8() & 1) != 0;
+    CPU_SET_A8((CPU_A8() >> 1) | old_c);
+    cpu_update_nz8(CPU_A8());
+}
+
+static inline void op_pha8(void) {
+    bus_wram_write8(g_cpu.S, CPU_A8());
+    g_cpu.S--;
+}
+
+static inline void op_pla8(void) {
+    g_cpu.S++;
+    CPU_SET_A8(bus_wram_read8(g_cpu.S));
+    cpu_update_nz8(CPU_A8());
+}
+
+static inline void op_phd(void) {
+    g_cpu.S--;
+    bus_wram_write16(g_cpu.S, g_cpu.DP);
+    g_cpu.S--;
+}
+
+static inline void op_pld(void) {
+    g_cpu.S++;
+    g_cpu.DP = bus_wram_read16(g_cpu.S);
+    g_cpu.S++;
+    cpu_update_nz16(g_cpu.DP);
+}
+
+static inline void op_bit_imm8(uint8_t val) {
+    g_cpu.flag_Z = (CPU_A8() & val) == 0;
+}
+
+static inline void op_bit_imm16(uint16_t val) {
+    g_cpu.flag_Z = (CPU_A16() & val) == 0;
+}
+
+static inline void op_bit_abs8(uint16_t addr) {
+    uint8_t val = bus_read8(g_cpu.DB, addr);
+    g_cpu.flag_Z = (CPU_A8() & val) == 0;
+    g_cpu.flag_N = (val & 0x80) != 0;
+    g_cpu.flag_V = (val & 0x40) != 0;
+}
+
 #endif /* SNESRECOMP_CPU_OPS_H */
