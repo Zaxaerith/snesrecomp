@@ -213,8 +213,20 @@ static void snesrecomp_capture_tick(void) {
     if (!s_shot_count && s_exit_frame < 0) return;
 
     s_frame_no++;
-    for (int i = 0; i < s_shot_count; i++)
-        if (s_shots[i] == s_frame_no) platform_request_screenshot();
+    for (int i = 0; i < s_shot_count; i++) {
+        if (s_shots[i] != s_frame_no) continue;
+        platform_request_screenshot();
+        /* SNESRECOMP_DUMP_PREFIX=ref -> ref_f000300.ppu.txt alongside the PNG,
+         * so a recomp run and a real-frame run can be diffed at the same frame. */
+        const char *pfx = getenv("SNESRECOMP_DUMP_PREFIX");
+        if (pfx) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s_f%06d.ppu.txt", pfx, s_frame_no);
+            snesrecomp_dump_ppu(path);
+            snprintf(path, sizeof(path), "%s_f%06d.snap", pfx, s_frame_no);
+            snesrecomp_dump_snapshot(path);
+        }
+    }
     if (s_exit_frame >= 0 && s_frame_no >= s_exit_frame) {
         fprintf(stderr, "snesrecomp: exit frame %ld reached\n", s_exit_frame);
         platform_shutdown();
@@ -469,6 +481,30 @@ void snesrecomp_dump_ppu(const char *filepath) {
     fprintf(dbg, "BG tileAdr: %04X %04X %04X %04X\n",
            ppu->bgLayer[0].tileAdr, ppu->bgLayer[1].tileAdr,
            ppu->bgLayer[2].tileAdr, ppu->bgLayer[3].tileAdr);
+    /* Per-BG geometry + screen enables. Enough to explain "right tiles, wrong
+     * place / wrong colours" without opening a debugger. */
+    fprintf(dbg, "bg3priority=%d\n", ppu->bg3priority);
+    for (int b = 0; b < 4; b++) {
+        fprintf(dbg, "BG%d: tilemapAdr=$%04X tileAdr=$%04X hScroll=%d vScroll=%d "
+                     "wider=%d higher=%d bigTiles=%d mosaic=%d "
+                     "main=%d sub=%d mainWin=%d subWin=%d\n",
+                b + 1,
+                ppu->bgLayer[b].tilemapAdr, ppu->bgLayer[b].tileAdr,
+                ppu->bgLayer[b].hScroll, ppu->bgLayer[b].vScroll,
+                ppu->bgLayer[b].tilemapWider, ppu->bgLayer[b].tilemapHigher,
+                ppu->bgLayer[b].bigTiles, ppu->bgLayer[b].mosaicEnabled,
+                ppu->layer[b].mainScreenEnabled, ppu->layer[b].subScreenEnabled,
+                ppu->layer[b].mainScreenWindowed, ppu->layer[b].subScreenWindowed);
+    }
+    /* First two BG3 tilemap rows — the toolbar strip lives here. */
+    for (int row = 0; row < 3; row++) {
+        fprintf(dbg, "BG3 map row %d ($%04X): ", row,
+                (unsigned)(ppu->bgLayer[2].tilemapAdr + row * 32));
+        for (int col = 0; col < 16; col++)
+            fprintf(dbg, "%04X ",
+                    ppu->vram[(ppu->bgLayer[2].tilemapAdr + row * 32 + col) & 0x7FFF]);
+        fprintf(dbg, "\n");
+    }
     fprintf(dbg, "CGRAM[0-7]: %04X %04X %04X %04X %04X %04X %04X %04X\n",
            ppu->cgram[0], ppu->cgram[1], ppu->cgram[2], ppu->cgram[3],
            ppu->cgram[4], ppu->cgram[5], ppu->cgram[6], ppu->cgram[7]);
