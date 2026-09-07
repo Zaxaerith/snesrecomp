@@ -360,6 +360,10 @@ void platform_frame_sync(void) {
     s_frame_start = SDL_GetPerformanceCounter();
 }
 
+void platform_request_screenshot(void) {
+    s_screenshot_requested = true;
+}
+
 void platform_shutdown(void) {
     menu_overlay_shutdown();
 

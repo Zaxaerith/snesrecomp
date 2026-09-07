@@ -10,6 +10,8 @@
 #include "snes.h"
 #include <SDL.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 /* Up to two opened game controllers (Xbox-style), assigned to players 1 and 2.
  * Empty slots are filled lazily each frame so hotplugged pads Just Work. */
@@ -165,6 +167,80 @@ static uint32_t build_mouse_serial(const SnesMouseState *ms) {
     return data;
 }
 
+/*
+ * Scripted mouse input — drives the SNES Mouse from an env var so a headless
+ * run can navigate menus reproducibly (regression captures, reaching a screen
+ * the recomp can't drive yet, bisecting a visual bug against real-frame mode).
+ *
+ *   SNESRECOMP_MOUSE_SCRIPT="frame:dx:dy:btn[:count] ..."
+ *
+ *   frame  1-based frame number (counts recomp_input_update calls)
+ *   dx,dy  signed per-frame mouse delta, SNES pixels
+ *   btn    0 (none), L, R, or LR
+ *   count  optional; repeat this step for N consecutive frames (default 1)
+ *
+ * Example — move right 8px/frame for 20 frames from frame 200, then click:
+ *   SNESRECOMP_MOUSE_SCRIPT="200:8:0:0:20 240:0:0:L:3 243:0:0:0:2"
+ *
+ * Steps are whitespace-separated and may be listed in any order. A frame with
+ * no step leaves the live SDL mouse untouched.
+ */
+#define MOUSE_SCRIPT_MAX 256
+typedef struct { int frame, dx, dy, count; bool left, right; } MouseStep;
+static MouseStep s_msteps[MOUSE_SCRIPT_MAX];
+static int       s_mstep_count = 0;
+static int       s_mscript_frame = 0;
+static int       s_mscript_parsed = 0;
+
+static void mouse_script_parse(void) {
+    s_mscript_parsed = 1;
+    const char *p = getenv("SNESRECOMP_MOUSE_SCRIPT");
+    if (!p) return;
+    while (*p && s_mstep_count < MOUSE_SCRIPT_MAX) {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        if (!*p) break;
+        char *end;
+        long frame = strtol(p, &end, 10);
+        if (end == p || *end != ':') break;
+        long dx = strtol(end + 1, &end, 10);
+        if (*end != ':') break;
+        long dy = strtol(end + 1, &end, 10);
+        if (*end != ':') break;
+        p = end + 1;
+        bool l = false, r = false;
+        while (*p == 'L' || *p == 'l' || *p == 'R' || *p == 'r' || *p == '0') {
+            if (*p == 'L' || *p == 'l') l = true;
+            if (*p == 'R' || *p == 'r') r = true;
+            p++;
+        }
+        long count = 1;
+        if (*p == ':') count = strtol(p + 1, &end, 10), p = end;
+        if (count < 1) count = 1;
+        MouseStep *s = &s_msteps[s_mstep_count++];
+        s->frame = (int)frame; s->dx = (int)dx; s->dy = (int)dy;
+        s->count = (int)count; s->left = l; s->right = r;
+    }
+    fprintf(stderr, "snesrecomp: mouse script parsed, %d step(s)\n", s_mstep_count);
+}
+
+static void mouse_script_apply(SnesMouseState *ms) {
+    if (!s_mscript_parsed) mouse_script_parse();
+    if (!s_mstep_count) return;
+    s_mscript_frame++;
+    for (int i = 0; i < s_mstep_count; i++) {
+        const MouseStep *s = &s_msteps[i];
+        if (s_mscript_frame >= s->frame && s_mscript_frame < s->frame + s->count) {
+            ms->dx = s->dx;
+            ms->dy = s->dy;
+            ms->left = s->left;
+            ms->right = s->right;
+            return;
+        }
+    }
+    /* No step covers this frame: hold still rather than inherit the real cursor. */
+    ms->dx = 0; ms->dy = 0; ms->left = false; ms->right = false;
+}
+
 void recomp_input_update(void) {
     Snes *snes = snesrecomp_get_snes();
     if (!snes) return;
@@ -186,9 +262,28 @@ void recomp_input_update(void) {
         ms->left  = (mouse_buttons & SDL_BUTTON_LMASK) != 0;
         ms->right = (mouse_buttons & SDL_BUTTON_RMASK) != 0;
 
-        /* Build serial data and latch it */
+        /* A scripted step for this frame overrides the live SDL mouse, so a
+         * headless run is reproducible and doesn't fight the real cursor. */
+        mouse_script_apply(ms);
+
+        /* Build serial data and latch it (used by the recomp path's own
+         * $4016/$4017 reads). */
         ms->latched = build_mouse_serial(ms);
         ms->read_count = 0;
+
+        /* Also feed LakeSnes's own mouse device. The recomp path reads the
+         * serial word above, but real-frame mode runs the genuine CPU against
+         * LakeSnes's Input struct — without this the mouse is dead there. */
+        snes_setMouseState(snes, 1, (int16_t)ms->dx, (int16_t)ms->dy,
+                           ms->left, ms->right);
+
+        if (getenv("SNESRECOMP_MOUSE_DEBUG")) {
+            static int n = 0;
+            if (n++ < 200 && (ms->dx || ms->dy || ms->left || ms->right))
+                fprintf(stderr, "[MOUSE] dx=%d dy=%d L=%d R=%d packet=%08X\n",
+                        ms->dx, ms->dy, ms->left, ms->right,
+                        snes->input1->mouseLatchedData);
+        }
 
         /*
          * For auto-joypad compatibility: set the first 16 bits of the

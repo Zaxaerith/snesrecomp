@@ -30,6 +30,10 @@ bool platform_poll_events(void);
 /* Wait to maintain ~60 Hz frame timing */
 void platform_frame_sync(void);
 
+/* Request a PNG screenshot of the next presented frame (same path as F12).
+ * Written to screenshot_NNNN.png in the working directory. */
+void platform_request_screenshot(void);
+
 /* Clean shutdown */
 void platform_shutdown(void);
 

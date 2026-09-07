@@ -177,6 +177,51 @@ bool snesrecomp_begin_frame(void) {
     return true;
 }
 
+
+/*
+ * Deterministic headless capture — makes visual regressions reproducible
+ * instead of racing a stopwatch against a live window.
+ *
+ *   SNESRECOMP_SHOT_FRAMES="120,300,600"  screenshot after those frame numbers
+ *   SNESRECOMP_EXIT_FRAME=700             exit(0) once that frame has presented
+ *
+ * Frames are counted per presented frame, so the same build + ROM always
+ * captures the same moment. Unset (the default) costs one getenv on frame 1.
+ */
+static void snesrecomp_capture_tick(void) {
+    static int  s_frame_no   = 0;
+    static int  s_parsed     = 0;
+    static int  s_shots[32];
+    static int  s_shot_count = 0;
+    static long s_exit_frame = -1;
+
+    if (!s_parsed) {
+        s_parsed = 1;
+        const char *f = getenv("SNESRECOMP_SHOT_FRAMES");
+        if (f) {
+            while (*f && s_shot_count < 32) {
+                char *end;
+                long v = strtol(f, &end, 10);
+                if (end == f) break;
+                s_shots[s_shot_count++] = (int)v;
+                f = (*end == ',') ? end + 1 : end;
+            }
+        }
+        const char *e = getenv("SNESRECOMP_EXIT_FRAME");
+        if (e) s_exit_frame = strtol(e, NULL, 10);
+    }
+    if (!s_shot_count && s_exit_frame < 0) return;
+
+    s_frame_no++;
+    for (int i = 0; i < s_shot_count; i++)
+        if (s_shots[i] == s_frame_no) platform_request_screenshot();
+    if (s_exit_frame >= 0 && s_frame_no >= s_exit_frame) {
+        fprintf(stderr, "snesrecomp: exit frame %ld reached\n", s_exit_frame);
+        platform_shutdown();
+        exit(0);
+    }
+}
+
 void snesrecomp_end_frame(void) {
     if (!s_snes) return;
 
@@ -256,6 +301,7 @@ void snesrecomp_end_frame(void) {
     snes_setSamples(s_snes, s_audio_buf, SAMPLES_PER_FRAME);
 
     /* Present video */
+    snesrecomp_capture_tick();
     platform_present_frame(s_pixel_buf);
 
     /* Queue audio */
@@ -317,6 +363,7 @@ void snesrecomp_realframe_end(void) {
     snes_runFrame(s_snes);
     snes_setPixels(s_snes, s_pixel_buf);
     snes_setSamples(s_snes, s_audio_buf, SAMPLES_PER_FRAME);
+    snesrecomp_capture_tick();
     platform_present_frame(s_pixel_buf);
     platform_queue_audio(s_audio_buf, SAMPLES_PER_FRAME);
     platform_frame_sync();
