@@ -194,6 +194,11 @@ static inline void op_stz_dp16(uint8_t dp) {
 /* ========== Transfer ========== */
 
 #define OP_TCS()  (g_cpu.S = g_cpu.C)
+/* TXS/TSX move the INDEX register, not the accumulator. Reset code is almost
+ * always LDX #$1FFF / TXS, so reaching for OP_TCS there silently leaves the
+ * stack pointer at whatever the accumulator held. */
+#define OP_TXS()  (g_cpu.S = g_cpu.X)
+#define OP_TSX()  (g_cpu.X = g_cpu.S)
 #define OP_TSC()  (g_cpu.C = g_cpu.S)
 #define OP_TCD()  (g_cpu.DP = g_cpu.C)
 #define OP_TDC()  (g_cpu.C = g_cpu.DP)

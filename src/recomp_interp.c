@@ -314,6 +314,14 @@ void recomp_interp_call(uint32_t snes_addr, bool is_long) {
      * would otherwise drift the stack down until it corrupts WRAM/overflows). */
     if (aborted) c->sp = start_sp;
 
+    /* SNESRECOMP_INTERP_STATS=1 — one line per interpreted routine: how many
+     * opcodes it actually ran and where it stopped. A routine that "returns"
+     * after a handful of ops has almost certainly tripped the stack-unwind
+     * completion check early rather than genuinely finishing. */
+    if (getenv("SNESRECOMP_INTERP_STATS"))
+        fprintf(stderr, "[INTERP] $%06X ran %ld ops, end pc=%02X:%04X sp=%04X (start_sp=%04X)%s\n",
+                snes_addr, ops, c->k, c->pc, c->sp, start_sp, aborted ? " ABORTED" : "");
+
     sync_from_lake(c);
 
     /* Restore the original (timed) memory handlers */
