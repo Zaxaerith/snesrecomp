@@ -113,6 +113,10 @@ SnesSuperScopeState *recomp_input_get_scope(void);
  */
 void recomp_input_set_scope(uint16_t x, uint16_t y, uint8_t buttons);
 
+/* True while SNESRECOMP_MOUSE_SCRIPT is driving the mouse. Host-pointer
+ * mapping is meaningless then — the script is the pointer. */
+bool recomp_input_mouse_script_active(void);
+
 /* Update keyboard/gamepad/mouse state and feed into LakeSnes input system */
 void recomp_input_update(void);
 

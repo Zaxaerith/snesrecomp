@@ -5,6 +5,7 @@
 
 #include "snesrecomp/platform.h"
 #include "snesrecomp/menu_overlay.h"
+#include "snesrecomp/input.h"
 #include "snesrecomp/snesrecomp.h"
 #include <SDL.h>
 #include <stdio.h>
@@ -362,6 +363,47 @@ void platform_frame_sync(void) {
 
 void platform_request_screenshot(void) {
     s_screenshot_requested = true;
+}
+
+bool platform_mouse_to_snes(int *x, int *y) {
+    if (!s_renderer || !s_window) return false;
+    /* A scripted mouse IS the pointer; the real cursor is irrelevant here (and
+     * would make headless runs depend on where the user happened to leave it). */
+    if (recomp_input_mouse_script_active()) return false;
+
+    int mx, my;
+    SDL_GetMouseState(&mx, &my);
+
+    /* SDL_GetMouseState is in window coordinates; the destination rect below is
+     * in renderer output coordinates. They differ on HiDPI displays. */
+    int win_w = 0, win_h = 0, out_w = 0, out_h = 0;
+    SDL_GetWindowSize(s_window, &win_w, &win_h);
+    SDL_GetRendererOutputSize(s_renderer, &out_w, &out_h);
+    if (win_w <= 0 || win_h <= 0 || out_w <= 0 || out_h <= 0) return false;
+    mx = mx * out_w / win_w;
+    my = my * out_h / win_h;
+
+    /* Same destination rect present_frame draws the game into. */
+    int menu_h = menu_overlay_get_menubar_height();
+    int dst_h = out_h - menu_h;
+    if (dst_h <= 0) return false;
+    if (mx < 0 || mx >= out_w || my < menu_h || my >= out_h) return false;
+
+    /* The source rect is the active picture at 2x (512x448 for 224 NTSC lines),
+     * so halving gives SNES pixels. */
+    int rx, ry, rw, rh;
+    snesrecomp_active_video_rect(&rx, &ry, &rw, &rh);
+    int snes_w = rw / 2, snes_h = rh / 2;
+    if (snes_w <= 0 || snes_h <= 0) return false;
+
+    int sx = mx * snes_w / out_w;
+    int sy = (my - menu_h) * snes_h / dst_h;
+    if (sx < 0) sx = 0; else if (sx >= snes_w) sx = snes_w - 1;
+    if (sy < 0) sy = 0; else if (sy >= snes_h) sy = snes_h - 1;
+
+    *x = sx;
+    *y = sy;
+    return true;
 }
 
 void platform_shutdown(void) {

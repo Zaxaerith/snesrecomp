@@ -223,6 +223,11 @@ static void mouse_script_parse(void) {
     fprintf(stderr, "snesrecomp: mouse script parsed, %d step(s)\n", s_mstep_count);
 }
 
+bool recomp_input_mouse_script_active(void) {
+    if (!s_mscript_parsed) mouse_script_parse();
+    return s_mstep_count > 0;
+}
+
 static void mouse_script_apply(SnesMouseState *ms) {
     if (!s_mscript_parsed) mouse_script_parse();
     if (!s_mstep_count) return;

@@ -34,6 +34,19 @@ void platform_frame_sync(void);
  * Written to screenshot_NNNN.png in the working directory. */
 void platform_request_screenshot(void);
 
+/*
+ * Map the host cursor to SNES screen pixels (x: 0..255, y: 0..223), inverting
+ * the same crop/scale/menu-bar offset platform_present_frame applies.
+ *
+ * Returns false when the pointer is outside the rendered game area (over the
+ * menu bar, or off-window), in which case *x/*y are untouched.
+ *
+ * A SNES mouse is a relative device, so a port that just forwards deltas drifts
+ * away from the host cursor and can never recover. With this, a game whose
+ * cursor position is known can steer toward the host pointer each frame instead.
+ */
+bool platform_mouse_to_snes(int *x, int *y);
+
 /* Clean shutdown */
 void platform_shutdown(void);
 
