@@ -176,7 +176,10 @@ static void sync_from_lake(Cpu *c) {
  * for NMI (which we drive externally) would otherwise loop forever. */
 #define INTERP_MAX_OPS 20000000L
 
+static unsigned long s_interp_calls = 0;   /* lets validation see a fallback */
+
 void recomp_interp_call(uint32_t snes_addr, bool is_long) {
+    s_interp_calls++;
     Snes *snes = snesrecomp_get_snes();
     if (!snes || !snes->cpu) return;
     Cpu *c = snes->cpu;
@@ -445,6 +448,12 @@ void recomp_timed_profile_dump(int top) {
  * correct function still produces a different snapshot. Here execution stays
  * genuine, so any difference is the function's own.
  *
+ * The last value written to each PPU/CPU I/O register ($2100-$21FF,
+ * $4200-$43FF) is compared too, since a register write (INIDISP brightness,
+ * a screen enable) leaves no trace in memory. Data ports ($2104, $2118/9,
+ * $2122, $2180) and the joypad strobe $4016 are left out: their effect is the
+ * memory they fill, which is compared anyway.
+ *
  * Bytes just below the entry stack pointer are not compared: the ROM routine
  * pushes there and a native body does not. Registers are compared but reported
  * separately (a hand-port often leaves A/X/Y different where no caller looks).
@@ -452,8 +461,9 @@ void recomp_timed_profile_dump(int top) {
  */
 typedef struct {
     uint32_t addr; bool is_long;
-    unsigned long calls, mem_fail, reg_fail, skipped;
+    unsigned long calls, mem_fail, reg_fail, skipped, mx_fail;
     char first[200];
+    char first_reg[160];
 } Validate;
 static Validate s_val[256];
 static int      s_val_n = 0;
@@ -461,12 +471,41 @@ static int      s_val_n = 0;
 typedef struct {
     int idx; uint8_t k; uint16_t pc, sp, entry_sp;
     uint8_t *ram; uint16_t *vram, *cgram, *oam; uint8_t *hoam;
-    uint16_t a, x, y, dp; uint8_t db;
+    uint16_t a, x, y, dp; uint8_t db, c, z, n, v, mf, xf;
+    uint8_t nio[0x300], nio_set[0x300];   /* native body's register writes */
+    uint8_t gio[0x300], gio_set[0x300];   /* genuine routine's */
 } Pending;
 #define VAL_DEPTH 8
 static Pending s_pend[VAL_DEPTH];
 static int     s_pend_n = 0;
 static uint8_t *s_state_buf = NULL;
+static Pending *s_native_cap = NULL;          /* set while a native body runs */
+static CpuWriteHandler s_genuine_write = NULL; /* CPU write handler we wrap */
+
+static int io_index(uint32_t adr) {
+    uint8_t bank = (uint8_t)(adr >> 16);
+    uint16_t a = (uint16_t)adr;
+    if (bank >= 0x40 && bank < 0x80) return -1;
+    if (bank >= 0xC0) return -1;
+    if (a == 0x2104 || a == 0x2118 || a == 0x2119 || a == 0x2122 || a == 0x2180) return -1;
+    if (a >= 0x2100 && a <= 0x21FF) return a - 0x2100;
+    if (a >= 0x4200 && a <= 0x43FF) return 0x100 + (a - 0x4200);
+    return -1;
+}
+
+void recomp_validate_note_write(uint32_t adr, uint8_t val) {
+    int i;
+    if (!s_native_cap || (i = io_index(adr)) < 0) return;
+    s_native_cap->nio[i] = val;
+    s_native_cap->nio_set[i] = 1;
+}
+
+static void genuine_write(void *mem, uint32_t adr, uint8_t val) {
+    int i = io_index(adr);
+    if (i >= 0)
+        for (int k = 0; k < s_pend_n; k++) { s_pend[k].gio[i] = val; s_pend[k].gio_set[i] = 1; }
+    s_genuine_write(mem, adr, val);
+}
 extern bool g_recomp_validating, g_recomp_frame_touched;
 
 void recomp_timed_add_validate(uint32_t snes_addr, bool is_long) {
@@ -483,9 +522,10 @@ void recomp_timed_add_validate(uint32_t snes_addr, bool is_long) {
 void recomp_timed_validate_report(void) {
     for (int i = 0; i < s_val_n; i++) {
         Validate *v = &s_val[i];
-        fprintf(stderr, "VALIDATE %06X calls=%lu mem_fail=%lu reg_fail=%lu skipped=%lu%s%s\n",
-                v->addr, v->calls, v->mem_fail, v->reg_fail, v->skipped,
-                v->first[0] ? " first: " : "", v->first);
+        fprintf(stderr, "VALIDATE %06X calls=%lu mem_fail=%lu reg_fail=%lu mx_fail=%lu skipped=%lu%s%s%s%s\n",
+                v->addr, v->calls, v->mem_fail, v->reg_fail, v->mx_fail, v->skipped,
+                v->first[0] ? " first: " : "", v->first,
+                v->first_reg[0] ? " | reg: " : "", v->first_reg);
     }
 }
 
@@ -511,13 +551,29 @@ static void validate_compare(Cpu *c, Pending *p) {
     for (int i = 0; i < 0x20; i++)
         if (sn->ppu->highOam[i] != p->hoam[i] && n++ == 0)
             snprintf(buf, sizeof(buf), "high oam $%02X rom=%02X native=%02X", i, sn->ppu->highOam[i], p->hoam[i]);
+    for (int i = 0; i < 0x300; i++) {
+        if (p->nio_set[i] == p->gio_set[i] && (!p->nio_set[i] || p->nio[i] == p->gio[i])) continue;
+        unsigned reg = i < 0x100 ? 0x2100 + i : 0x4200 + (i - 0x100);
+        if (n++ == 0)
+            snprintf(buf, sizeof(buf), "io $%04X rom=%s%02X native=%s%02X", reg,
+                     p->gio_set[i] ? "" : "unwritten/", p->gio[i],
+                     p->nio_set[i] ? "" : "unwritten/", p->nio[i]);
+    }
     v->calls++;
     if (n) {
         v->mem_fail++;
         if (!v->first[0])
             snprintf(v->first, sizeof(v->first), "call %lu, frame %u: %s (%d differ)", v->calls, sn->frames, buf, n);
-    } else if (c->a != p->a || c->x != p->x || c->y != p->y || c->db != p->db || c->dp != p->dp) {
+    } else if (c->a != p->a || c->x != p->x || c->y != p->y || c->db != p->db || c->dp != p->dp ||
+               c->c != p->c || c->z != p->z || c->n != p->n || c->v != p->v ||
+               c->mf != p->mf || c->xf != p->xf) {
         v->reg_fail++;
+        if (c->mf != p->mf || c->xf != p->xf) v->mx_fail++;   /* caller runs at the wrong width */
+        if (!v->first_reg[0])
+            snprintf(v->first_reg, sizeof(v->first_reg),
+                     "rom A=%04X X=%04X Y=%04X C%d Z%d N%d V%d M%d X%d / native A=%04X X=%04X Y=%04X C%d Z%d N%d V%d M%d X%d",
+                     c->a, c->x, c->y, c->c, c->z, c->n, c->v, c->mf, c->xf,
+                     p->a, p->x, p->y, p->c, p->z, p->n, p->v, p->mf, p->xf);
     }
 }
 
@@ -540,6 +596,7 @@ static bool validate_hook(Cpu *c) {
         else if (c->sp > p->sp) s_val[p->idx].skipped++;
         else break;
         s_pend_n--;
+        if (s_pend_n == 0 && c->write == genuine_write) c->write = s_genuine_write;
     }
 
     int idx = -1;
@@ -577,6 +634,10 @@ static bool validate_hook(Cpu *c) {
     p->sp = (uint16_t)(sp + (v->is_long ? 3 : 2));
 
     int size = snes_saveState(sn, s_state_buf);
+    memset(p->nio_set, 0, sizeof(p->nio_set));
+    memset(p->gio_set, 0, sizeof(p->gio_set));
+    s_native_cap = p;
+    unsigned long interp_before = s_interp_calls;
     sync_from_lake(c);
     s_redirect = 0xFFFFFFFFu;
     s_timed_depth++;
@@ -584,10 +645,14 @@ static bool validate_hook(Cpu *c) {
     g_recomp_frame_touched = false;
     fn();
     g_recomp_validating = false;
+    s_native_cap = NULL;
     s_timed_depth--;
     sync_to_lake(c);
-    /* Exits by jump, or drives frames itself: no single return to compare at. */
-    bool redirected = s_redirect != 0xFFFFFFFFu || g_recomp_frame_touched;
+    /* Exits by jump, drives frames itself, or falls back to the (untimed)
+     * interpreter for a callee: not something that can be verified as a native
+     * body inside the timed loop, so the call is skipped. */
+    bool redirected = s_redirect != 0xFFFFFFFFu || g_recomp_frame_touched ||
+                      s_interp_calls != interp_before;
     s_redirect = 0xFFFFFFFFu;
     memcpy(p->ram, sn->ram, 0x20000);
     memcpy(p->vram, sn->ppu->vram, 0x10000);
@@ -595,13 +660,15 @@ static bool validate_hook(Cpu *c) {
     memcpy(p->oam, sn->ppu->oam, 0x200);
     memcpy(p->hoam, sn->ppu->highOam, 0x20);
     p->a = c->a; p->x = c->x; p->y = c->y; p->dp = c->dp; p->db = c->db;
+    p->c = c->c; p->z = c->z; p->n = c->n; p->v = c->v; p->mf = c->mf; p->xf = c->xf;
     if (!snes_loadState(sn, s_state_buf, size)) {
         fprintf(stderr, "validate: state restore failed at $%06X (size %d)\n", pc, size);
         abort();
     }
 
-    if (redirected) v->skipped++;
-    else s_pend_n++;
+    if (redirected) { v->skipped++; return true; }
+    s_pend_n++;
+    if (c->write != genuine_write) { s_genuine_write = c->write; c->write = genuine_write; }
     return true;
 }
 
