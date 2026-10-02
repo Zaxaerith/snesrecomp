@@ -364,6 +364,16 @@ void recomp_timed_add_intercept(uint32_t snes_addr, bool is_long) {
 
 unsigned long recomp_timed_intercept_hits(void) { return s_intercept_hits; }
 
+/* Depth of native bodies currently running inside the timed loop. */
+static int s_timed_depth = 0;
+
+bool recomp_timed_spin(int master_cycles) {
+    Snes *sn = snesrecomp_get_snes();
+    if (!s_timed_depth || !sn) return false;
+    snes_runCycles(sn, master_cycles);
+    return true;
+}
+
 /* Redirect protocol: an intercepted function whose original ends in a JMP/JML
  * (not RTS/RTL) calls recomp_set_redirect(target) instead of returning; the
  * hook then sets PB:PC to the target (no stack pop), matching the jump. */
@@ -378,14 +388,14 @@ void recomp_set_redirect(uint32_t snes_addr) { s_redirect = snes_addr; }
 /* Records each direct JSR/JSL target with the M/X flags the callee enters with
  * (= the caller's current flags; JSR/JSL preserve P), and a multi-flag marker so
  * the auto-generator can skip per-(M,X) variant targets. */
-typedef struct { uint32_t addr; unsigned long count; uint8_t m, x, multi; } CallTally;
+typedef struct { uint32_t addr; unsigned long count; uint8_t m, x, multi, jsl; } CallTally;
 static CallTally s_tally[8192];
 static int       s_tally_n  = 0;
 static bool      s_profile  = false;
 
 void recomp_timed_profile_enable(void) { s_profile = true; }
 
-static void tally_call(uint32_t target, uint8_t m, uint8_t x) {
+static void tally_call(uint32_t target, uint8_t m, uint8_t x, uint8_t jsl) {
     for (int i = 0; i < s_tally_n; i++)
         if (s_tally[i].addr == target) {
             s_tally[i].count++;
@@ -399,13 +409,14 @@ static void tally_call(uint32_t target, uint8_t m, uint8_t x) {
         s_tally[s_tally_n].addr = target;
         s_tally[s_tally_n].count = 1;
         s_tally[s_tally_n].m = m; s_tally[s_tally_n].x = x; s_tally[s_tally_n].multi = 0;
+        s_tally[s_tally_n].jsl = jsl;
         s_tally_n++;
     }
 }
 
 void recomp_timed_profile_dump(int top) {
     fprintf(stderr, "=== timed-recomp call profile: %d distinct JSR/JSL targets ===\n", s_tally_n);
-    fprintf(stderr, "# addr   count    P(entry)  flags\n");
+    fprintf(stderr, "# addr   count    P(entry) call flags\n");
     for (int k = 0; k < top; k++) {
         int best = -1; unsigned long bc = 0;
         for (int i = 0; i < s_tally_n; i++)
@@ -413,11 +424,185 @@ void recomp_timed_profile_dump(int top) {
         if (best < 0) break;
         CallTally *t = &s_tally[best];
         uint8_t P = (uint8_t)((t->m ? 0x20 : 0) | (t->x ? 0x10 : 0));
-        fprintf(stderr, "PROF %06X %-8lu %02X %s%s\n", t->addr, t->count, P,
+        fprintf(stderr, "PROF %06X %-8lu %02X %s %s%s\n", t->addr, t->count, P, t->jsl ? "JSL" : "JSR",
                 t->multi ? "MULTI-MX " : "",
                 func_table_lookup(t->addr) ? "recompiled" : "");
         t->count = 0;  /* consume so the next pass finds the next-highest */
     }
+}
+
+/* --- Lockstep validation ---------------------------------------------------
+ *
+ * Checks a recompiled function against the genuine routine on every call,
+ * without letting it change the run. At each entry: save the machine, run the
+ * native body, keep what it produced, restore, and let the ROM routine run
+ * for real. When the ROM routine returns (PB:PC = return address, S back to
+ * its pre-call value), compare WRAM, VRAM, CGRAM and OAM with what the native
+ * body produced.
+ *
+ * Intercepting instead (recomp_timed_add_intercept) is not a usable test: the
+ * native body costs zero cycles, so later work lands on different frames and a
+ * correct function still produces a different snapshot. Here execution stays
+ * genuine, so any difference is the function's own.
+ *
+ * Bytes just below the entry stack pointer are not compared: the ROM routine
+ * pushes there and a native body does not. Registers are compared but reported
+ * separately (a hand-port often leaves A/X/Y different where no caller looks).
+ * A native body that exits through recomp_set_redirect is counted as skipped.
+ */
+typedef struct {
+    uint32_t addr; bool is_long;
+    unsigned long calls, mem_fail, reg_fail, skipped;
+    char first[200];
+} Validate;
+static Validate s_val[256];
+static int      s_val_n = 0;
+
+typedef struct {
+    int idx; uint8_t k; uint16_t pc, sp, entry_sp;
+    uint8_t *ram; uint16_t *vram, *cgram, *oam; uint8_t *hoam;
+    uint16_t a, x, y, dp; uint8_t db;
+} Pending;
+#define VAL_DEPTH 8
+static Pending s_pend[VAL_DEPTH];
+static int     s_pend_n = 0;
+static uint8_t *s_state_buf = NULL;
+extern bool g_recomp_validating, g_recomp_frame_touched;
+
+void recomp_timed_add_validate(uint32_t snes_addr, bool is_long) {
+    for (int i = 0; i < s_val_n; i++)
+        if (s_val[i].addr == snes_addr) return;
+    if (s_val_n < (int)(sizeof(s_val) / sizeof(s_val[0]))) {
+        memset(&s_val[s_val_n], 0, sizeof(Validate));
+        s_val[s_val_n].addr = snes_addr;
+        s_val[s_val_n].is_long = is_long;
+        s_val_n++;
+    }
+}
+
+void recomp_timed_validate_report(void) {
+    for (int i = 0; i < s_val_n; i++) {
+        Validate *v = &s_val[i];
+        fprintf(stderr, "VALIDATE %06X calls=%lu mem_fail=%lu reg_fail=%lu skipped=%lu%s%s\n",
+                v->addr, v->calls, v->mem_fail, v->reg_fail, v->skipped,
+                v->first[0] ? " first: " : "", v->first);
+    }
+}
+
+static void validate_compare(Cpu *c, Pending *p) {
+    Snes *sn = snesrecomp_get_snes();
+    Validate *v = &s_val[p->idx];
+    char buf[200] = "";
+    int n = 0;
+    for (int i = 0; i < 0x20000; i++) {
+        if (i <= p->entry_sp && i > p->entry_sp - 0x100) continue;   /* stack scratch */
+        if (sn->ram[i] != p->ram[i] && n++ == 0)
+            snprintf(buf, sizeof(buf), "wram $%05X rom=%02X native=%02X", i, sn->ram[i], p->ram[i]);
+    }
+    for (int i = 0; i < 0x8000; i++)
+        if (sn->ppu->vram[i] != p->vram[i] && n++ == 0)
+            snprintf(buf, sizeof(buf), "vram word $%04X rom=%04X native=%04X", i, sn->ppu->vram[i], p->vram[i]);
+    for (int i = 0; i < 0x100; i++)
+        if (sn->ppu->cgram[i] != p->cgram[i] && n++ == 0)
+            snprintf(buf, sizeof(buf), "cgram $%02X rom=%04X native=%04X", i, sn->ppu->cgram[i], p->cgram[i]);
+    for (int i = 0; i < 0x100; i++)
+        if (sn->ppu->oam[i] != p->oam[i] && n++ == 0)
+            snprintf(buf, sizeof(buf), "oam word $%02X rom=%04X native=%04X", i, sn->ppu->oam[i], p->oam[i]);
+    for (int i = 0; i < 0x20; i++)
+        if (sn->ppu->highOam[i] != p->hoam[i] && n++ == 0)
+            snprintf(buf, sizeof(buf), "high oam $%02X rom=%02X native=%02X", i, sn->ppu->highOam[i], p->hoam[i]);
+    v->calls++;
+    if (n) {
+        v->mem_fail++;
+        if (!v->first[0])
+            snprintf(v->first, sizeof(v->first), "call %lu, frame %u: %s (%d differ)", v->calls, sn->frames, buf, n);
+    } else if (c->a != p->a || c->x != p->x || c->y != p->y || c->db != p->db || c->dp != p->dp) {
+        v->reg_fail++;
+    }
+}
+
+/* Called from the timed hook at every opcode. True = pc was a validated entry
+ * (the genuine routine now runs; the hook must not intercept it). */
+static bool validate_hook(Cpu *c) {
+    /* A native body under check can fall back to the interpreter, which comes
+     * back through this hook. Nothing it runs is genuine, and a nested check
+     * would overwrite the saved state the outer one restores from. */
+    if (g_recomp_validating) return false;
+    uint32_t pc = ((uint32_t)c->k << 16) | (uint16_t)c->pc;
+
+    /* A pending routine returned? Innermost first. If the stack has unwound
+     * past its return frame without coming back through it (it popped its own
+     * return address, as jump-table dispatchers do), there is no comparison
+     * point: drop it as skipped. */
+    while (s_pend_n > 0) {
+        Pending *p = &s_pend[s_pend_n - 1];
+        if (c->k == p->k && c->pc == p->pc && c->sp == p->sp) validate_compare(c, p);
+        else if (c->sp > p->sp) s_val[p->idx].skipped++;
+        else break;
+        s_pend_n--;
+    }
+
+    int idx = -1;
+    for (int i = 0; i < s_val_n; i++)
+        if (s_val[i].addr == pc) { idx = i; break; }
+    if (idx < 0 || s_pend_n >= VAL_DEPTH) return false;
+    /* Each check copies the whole machine twice, so a routine called 100k
+     * times would take minutes. SNESRECOMP_VALIDATE_MAX (default 300) caps the
+     * checked calls per function; later calls just run genuine. */
+    static long s_max = -1;
+    if (s_max < 0) { const char *e = getenv("SNESRECOMP_VALIDATE_MAX"); s_max = e ? atol(e) : 300; }
+    if ((long)(s_val[idx].calls + s_val[idx].skipped) >= s_max) return false;
+    snes_func_t fn = func_table_lookup(pc);
+    if (!fn) return false;
+
+    Snes *sn = snesrecomp_get_snes();
+    Validate *v = &s_val[idx];
+    Pending *p = &s_pend[s_pend_n];
+    if (!s_state_buf) s_state_buf = (uint8_t *)malloc(1 << 20);
+    if (!p->ram) {
+        p->ram = (uint8_t *)malloc(0x20000);
+        p->vram = (uint16_t *)malloc(0x10000);
+        p->cgram = (uint16_t *)malloc(0x200);
+        p->oam = (uint16_t *)malloc(0x200);
+        p->hoam = (uint8_t *)malloc(0x20);
+    }
+
+    /* Where the genuine routine will come back to. */
+    uint16_t sp = c->sp;
+    uint16_t ret = (uint16_t)(bus_read8(0x00, (sp + 1) & 0xFFFF) | (bus_read8(0x00, (sp + 2) & 0xFFFF) << 8));
+    p->idx = idx;
+    p->entry_sp = sp;
+    p->pc = (uint16_t)(ret + 1);
+    p->k  = v->is_long ? bus_read8(0x00, (sp + 3) & 0xFFFF) : c->k;
+    p->sp = (uint16_t)(sp + (v->is_long ? 3 : 2));
+
+    int size = snes_saveState(sn, s_state_buf);
+    sync_from_lake(c);
+    s_redirect = 0xFFFFFFFFu;
+    s_timed_depth++;
+    g_recomp_validating = true;
+    g_recomp_frame_touched = false;
+    fn();
+    g_recomp_validating = false;
+    s_timed_depth--;
+    sync_to_lake(c);
+    /* Exits by jump, or drives frames itself: no single return to compare at. */
+    bool redirected = s_redirect != 0xFFFFFFFFu || g_recomp_frame_touched;
+    s_redirect = 0xFFFFFFFFu;
+    memcpy(p->ram, sn->ram, 0x20000);
+    memcpy(p->vram, sn->ppu->vram, 0x10000);
+    memcpy(p->cgram, sn->ppu->cgram, 0x200);
+    memcpy(p->oam, sn->ppu->oam, 0x200);
+    memcpy(p->hoam, sn->ppu->highOam, 0x20);
+    p->a = c->a; p->x = c->x; p->y = c->y; p->dp = c->dp; p->db = c->db;
+    if (!snes_loadState(sn, s_state_buf, size)) {
+        fprintf(stderr, "validate: state restore failed at $%06X (size %d)\n", pc, size);
+        abort();
+    }
+
+    if (redirected) v->skipped++;
+    else s_pend_n++;
+    return true;
 }
 
 static bool timed_recomp_hook(Cpu *c) {
@@ -427,14 +612,16 @@ static bool timed_recomp_hook(Cpu *c) {
             uint32_t t = ((uint32_t)c->k << 16)
                        | bus_read8(c->k, c->pc + 1)
                        | ((uint32_t)bus_read8(c->k, c->pc + 2) << 8);
-            tally_call(t, c->mf, c->xf);
+            tally_call(t, c->mf, c->xf, 0);
         } else if (op == 0x22) {  /* JSL long */
             uint32_t t = bus_read8(c->k, c->pc + 1)
                        | ((uint32_t)bus_read8(c->k, c->pc + 2) << 8)
                        | ((uint32_t)bus_read8(c->k, c->pc + 3) << 16);
-            tally_call(t, c->mf, c->xf);
+            tally_call(t, c->mf, c->xf, 1);
         }
     }
+
+    if (s_val_n && validate_hook(c)) return false;   /* genuine routine runs */
 
     uint32_t pc = ((uint32_t)c->k << 16) | (uint16_t)c->pc;
     const TimedIntercept *e = NULL;
@@ -454,7 +641,9 @@ static bool timed_recomp_hook(Cpu *c) {
 
     sync_from_lake(c);   /* LakeSnes CPU regs -> g_cpu (native body reads these) */
     s_redirect = 0xFFFFFFFFu;
+    s_timed_depth++;
     fn();                /* run recompiled native body (g_cpu + recomp bus) */
+    s_timed_depth--;
     sync_to_lake(c);     /* g_cpu -> LakeSnes CPU regs */
 
     /* JMP/JML exit: the function redirected instead of returning. Set PB:PC to
