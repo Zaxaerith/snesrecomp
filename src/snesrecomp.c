@@ -79,6 +79,20 @@ void snesrecomp_dump_snapshot(const char *filepath) {
     fclose(f);
 }
 
+int snesrecomp_parse_args(int argc, char **argv) {
+    bool headless = false;
+    const char *record = NULL;
+    int out = 1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--headless")) headless = true;
+        else if (!strcmp(argv[i], "--record") && i + 1 < argc) { record = argv[++i]; headless = true; }
+        else argv[out++] = argv[i];
+    }
+    if (headless) platform_set_headless(record);
+    argv[out] = NULL;
+    return out;
+}
+
 bool snesrecomp_init(const char *window_title, int scale) {
     /* Create LakeSnes instance (allocates CPU, PPU, APU, DMA, Cart) */
     s_snes = snes_init();
@@ -159,7 +173,15 @@ bool snesrecomp_load_rom(const char *path) {
     return true;
 }
 
+/* Set by lockstep validation while a native body runs on a throwaway copy of
+ * the machine: a frame presented there would advance the capture clock, the
+ * mouse script and the host window for real. recomp_interp.c reads
+ * g_recomp_frame_touched to mark the check as skipped. */
+bool g_recomp_validating = false;
+bool g_recomp_frame_touched = false;
+
 bool snesrecomp_begin_frame(void) {
+    if (g_recomp_validating) { g_recomp_frame_touched = true; return true; }
     /* Poll SDL events */
     if (!platform_poll_events()) {
         return false;
@@ -236,6 +258,7 @@ static void snesrecomp_capture_tick(void) {
 
 void snesrecomp_end_frame(void) {
     if (!s_snes) return;
+    if (g_recomp_validating) { g_recomp_frame_touched = true; return; }
 
     /* Start-of-frame PPU bookkeeping (toggles evenFrame, resets mosaic, etc.) */
     ppu_handleFrameStart(s_snes->ppu);
